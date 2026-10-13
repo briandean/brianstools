@@ -63,6 +63,17 @@ When the window is smaller than a page, scrollbars appear on the right and along
 - **Any Tk version:** works with the wheel and trackpad on Tk 8.6 and on Tk 8.7 / 9 (for example Homebrew Python on macOS, where trackpads send a different kind of scroll event).
 - **Troubleshooting:** if scrolling misbehaves, start the app from a terminal with `BRIANSTOOLS_DEBUG_WHEEL=1 python3 brianstools.py`. Each wheel or trackpad event is printed with the widget under the pointer.
 
+### Resizing text boxes and tables
+
+Every text box and table in the tools has a small grip bar centered under it. Drag the grip up or down to make that box shorter or taller.
+
+- **Snaps to whole lines and rows,** so nothing is cut in half. The smallest size is two lines or rows.
+- **Keeps its size:** a box you've sized stays that height instead of stretching to fill the window, and a box taller than the window makes the page scroll.
+- **Remembered:** heights are saved between launches, counted in lines and rows so they follow your text size.
+- **Back to automatic:** double-click the grip.
+- **Compare side by side:** one grip under the pair sizes both sides together.
+- **Dialogs:** pop-up windows such as Add list… and the settings editor have no grips. Resize the window instead.
+
 ### Appearance (light and dark)
 
 **Tools → Appearance** offers **Follow system** (the default), **Light**, or **Dark**. The change applies right away and is remembered.
@@ -79,7 +90,7 @@ The app uses each platform's own interface font: SF Pro on macOS, Segoe UI on Wi
 
 ### Settings and saved data
 
-Everything the app remembers between launches is in `settings.json`. The downloaded `oui.txt`, the RPKI VRP cache `rpki-vrps.json`, the domain RDAP list `rdap-dns.json`, and the Bandwidth Cost comparison `costs.json` sit in the same folder:
+Everything the app remembers between launches is in `settings.json`. The downloaded `oui.txt`, the RPKI VRP cache `rpki-vrps.json`, the domain RDAP list `rdap-dns.json`, and the Bandwidth Cost comparison `costs.json` sit in the same folder (your PeeringDB API key, if you add one, is in `settings.json`):
 
 - **macOS:** `~/Library/Application Support/BriansTools/` (in Finder: ⌘⇧G and paste that path)
 - **Windows:** `%APPDATA%\BriansTools\`
@@ -270,25 +281,29 @@ Runs your system's traceroute (`traceroute` on macOS/Linux, `tracert` on Windows
 
 ### Whois
 
-IP address, prefix, and ASN lookups using ARIN's Whois-RWS REST API (`whois.arin.net/rest`, JSON).
+Who announces an IP address or prefix, and who owns an ASN, BGP AS path, or domain name. Pick the **Source** for IPs and ASNs: **Ask [Team Cymru](https://www.team-cymru.com)** (the default) uses Team Cymru's IP to ASN mapping service (`whois.cymru.com`): the origin AS and BGP prefix covering an address, plus the AS name, country, registry and allocation date, for a whole list in one query. **ARIN and the other registries (RDAP)** asks ARIN's Whois-RWS REST API (`whois.arin.net/rest`) item by item, following other registries over RDAP: net names, organizations, reassigned customers, and abuse contacts. The choice is remembered.
 
-- **Input:** type one item or paste any text, e.g. a firewall log. IPv4/IPv6 addresses, prefixes (`8.8.8.0/24`), and ASNs (`AS15169` or plain `15169`) are picked out and highlighted. Bare handles (`GOGL`, `NET-8-8-8-0-2`, `ABUSE5250-ARIN`) work too.
+- **Input:** type one item or paste any text, e.g. a firewall log. IPv4/IPv6 addresses, prefixes (`8.8.8.0/24`), and ASNs (`AS15169` or plain `15169`) are picked out and highlighted. A prefix is looked up by its first address. Bare ARIN handles (`GOGL`, `NET-8-8-8-0-2`) still go to ARIN, since Team Cymru only maps IPs and ASNs.
 - **AS paths:** paste a BGP AS path and every ASN in it is looked up, with no "AS" prefix needed. The **AS path owners** box shows the chain in order, e.g. `AS3356 ×3 (Level 3) → AS174 (Cogent) → AS3320 (Deutsche Telekom AG) → AS15169 (Google LLC)`, with **Copy paths**.
   - **Recognised formats:** a bare path (`3356 174 15169`), `AS path: 6939 13335 I` (Junos), IOS-XR/IOS detail lines (`3356 2914 15169, (received & used)`), and `show ip bgp` table rows. In table rows, the metric, local-pref, and weight columns are skipped.
   - **Path details:** prepends are collapsed (×N), AS-sets `{…}` and confederations `(…)` are handled, and asdot (`1.10`) is converted. Private, documentation, and AS_TRANS ASNs are flagged instead of looked up.
   - **Tick boxes:** choose which kinds of item to look up (IPs, ASNs, plain numbers as ASNs), e.g. ASNs only when pasting `show bgp` output.
-- **Results table:** network/CIDR, net name, organization (or reassigned customer), country, allocation type, and abuse email. The **Details** pane shows a whois-style record with net range, parent, origin AS, org address, comments, and abuse/NOC/tech contacts.
-- **Fewer queries:** private, CGNAT, and other special-use addresses are skipped by default. Addresses in a network already returned reuse that result instead of another query, and replies are cached for the session.
+- **Results table ([Team Cymru](https://www.team-cymru.com)):** query, BGP prefix (network), origin AS, owner (the origin's AS name), country, type and registry, and allocation date. An address that isn't announced in BGP shows **not announced** in grey; a prefix with more than one origin AS lists them all (`AS13335 / AS64500`) in orange. The **Details** pane shows the full record.
+- **One query for the whole list ([Team Cymru](https://www.team-cymru.com)):** every IP and ASN goes to [Team Cymru](https://www.team-cymru.com) in a single bulk whois request (TCP port 43), so even hundreds of items come back in a second or two. Up to 2,000 items per lookup. Private, CGNAT, and other special-use addresses are skipped by default.
+- **Ask [Team Cymru](https://www.team-cymru.com) via:** **Auto** uses whois on TCP port 43 and switches to DNS by itself if port 43 is blocked (the status line says so). **whois (TCP 43)** never falls back. **DNS** asks TXT records under `origin.asn.cymru.com`, `origin6.asn.cymru.com` and `asn.cymru.com` through this computer's resolver: slower (a query or two per item, AS names cached), but it works where only DNS gets out. If DNS isn't answering at all, the lookup gives up after three failures instead of waiting on every item. Before trusting DNS it checks one record that always exists (AS15169's); if a filtering resolver hides it, every row says so instead of wrongly showing **not announced**.
+- **Results table (ARIN):** the columns change to network/CIDR, net name, organization (or reassigned customer), country, allocation type, and abuse email. The **Details** pane shows a whois-style record with net range, parent, origin AS, org address, comments, and abuse/NOC/tech contacts.
+- **Fewer queries (ARIN):** private, CGNAT, and other special-use addresses are skipped by default. Addresses in a network already returned reuse that result instead of another query, and replies are cached for the session.
+- **Other registries (ARIN):** for addresses and ASNs registered with RIPE, APNIC, LACNIC, or AFRINIC, ARIN only points to that registry. The owner, network/AS name, country, and abuse email are then fetched from that registry over RDAP (via ARIN's RDAP redirector, `rdap.arin.net`), so every hop in a path gets a real owner. Untick "Get owners from other registries" to stay ARIN-only.
 - **Domain names:** `example.com`, host names like `www.mail.example.co.uk` (looked up as their registered domain), or domains in any pasted text, such as a phishing report. Only names ending in a real TLD count, so `invoice.pdf` or `v1.2.3` are ignored.
   - **RDAP first:** IANA's bootstrap file (cached for a week) gives each TLD's RDAP server, e.g. Verisign for .com or Nominet for .uk. The registrar's RDAP is then followed for registrant org and country.
   - **Not registered:** if the registry has no record of the name, the row says **Not registered (domain not found)** and the details explain it, instead of showing an error. If RDAP can't be reached, port-43 WHOIS is asked before deciding. An error appears only when neither could be reached.
   - **Certificates:** HTTPS lookups are verified against this computer's own trusted certificates: the Windows certificate store, `/etc/ssl` on Linux, and on macOS the **Keychain** (Apple's built-in roots plus any admin- or MDM-installed roots in the System keychain). Python can't read the Keychain itself, so the app loads it, which means python.org Python and the compiled `.app` both work without "Install Certificates.command". If a server still can't be verified (e.g. an intercepting proxy whose root isn't trusted), the lookup retries without certificate checking, then over plain HTTP, and the status line says so.
   - **Port-43 WHOIS fallback:** for TLDs without RDAP (e.g. .io, .de), `whois.iana.org` gives the registry's WHOIS server and the common fields are parsed from its reply. DENIC's `-T dn,ace` and JPRS's `/e` query formats are handled.
-  - **Results:** the table shows registered domain, registrar, registrant org (or "not published"), country, abuse email, and expiry, with orange highlighting when it's under 30 days. Details include created/updated/expires dates, status codes, name servers, DNSSEC, registrar IANA ID, the source servers, and the raw WHOIS text when port 43 was used.
+  - **Results:** the table shows registered domain, registrant org (or "not published"), country, created date (in the Allocated column), and the registrar and expiry in Notes (with ARIN as the source: registrar, abuse email and expiry in their own columns), with orange highlighting when expiry is under 30 days. Details include created/updated/expires dates, status codes, name servers, DNSSEC, registrar and abuse contacts, the source servers, and the raw WHOIS text when port 43 was used.
   - **Links:** right-click a domain row to dig, ping, or traceroute it. **Open in ICANN Lookup** opens the record on lookup.icann.org.
-- **Other registries:** for addresses and ASNs registered with RIPE, APNIC, LACNIC, or AFRINIC, ARIN only points to that registry. The owner, network/AS name, country, and abuse email are then fetched from that registry over RDAP (via ARIN's RDAP redirector, `rdap.arin.net`), so every hop in a path gets a real owner. Untick "Get owners from other registries" to stay ARIN-only.
-- **Right-click a row:** copy the address or abuse email, open the network in IP Calc, or ping or traceroute the address. **Open in ARIN Search** opens the record on arin.net.
-- **Terms of use:** ARIN data is subject to ARIN's Whois Terms of Use.
+- **Right-click a row:** copy the address, then whatever the source gives: origin AS, AS name, and the BGP prefix in IP Calc (Team Cymru), or the abuse email and the network in IP Calc (ARIN). Ping or traceroute an address from here too. The Details button opens the item on **bgp.he.net** (Team Cymru) or **ARIN Search** (ARIN).
+- **About [Team Cymru](https://www.team-cymru.com)'s data:** [Team Cymru](https://www.team-cymru.com) builds the mapping from BGP feeds and the registries' delegation files. Country, registry and allocation date describe the registry allocation that covers the prefix, not the end user. There are no contacts or net names; switch the Source to ARIN and the other registries when you need abuse contacts. See <https://www.team-cymru.com/ip-asn-mapping>.
+- **Terms of use:** with the ARIN source, data is subject to ARIN's Whois Terms of Use.
 
 ### Route Table
 
@@ -350,6 +365,20 @@ Builds BGP prefix filters from the IRR, the way bgpq4 does, and checks every rou
   - **Plain list:** one prefix per line.
 - **Copy config** and **Save…** export the filter. Copy table and Copy work on the two tables.
 - **Send to IRR / RPKI:** right-click text such as `neighbor 192.0.2.1 remote-as 64501` or an AS path to look those ASNs up.
+
+### PeeringDB
+
+Look up networks, internet exchanges, facilities and organizations in [PeeringDB](https://www.peeringdb.com), the interconnection database peering coordinators use, and see them laid out the way the website shows them.
+
+- **Input:** an ASN (`10279` or `AS10279`), a [PeeringDB](https://www.peeringdb.com) link such as `https://www.peeringdb.com/net/20321` (also `/ix/`, `/fac/` and `/org/` links, or `ix 26`), an exchange peering IP address (`206.126.110.58` or IPv6), or part of a name to search for. Press Return or **Look up**.
+- **Networks, laid out like the website:** the left column lists Organization, Also Known As, Long Name, Company Website and Website Override, Social Media, ASN, IRR as-set, Route Server and Looking Glass URLs, Network Types, IPv4/IPv6 Prefixes, Traffic Levels and Ratios, Geographic Scope, Protocols Supported, the Last Updated dates, Notes and RIR Status. The right column has **Peering Policy Information** (policy URL, general policy, multiple locations, ratio and contract requirements) and **Contact Information** (role, name, visibility, phone, e-mail). Below are **Public Peering Exchange Points** (exchange, ASN, IPv4, IPv6, capacity, port location, RS peer, BFD support, status) and **Interconnection Facilities** (facility, ASN, country, city).
+- **Exchanges, facilities and organizations** open the same way: an exchange shows its details, contacts, LAN (MTU, DOT1Q, route server ASN, IX-F export) and prefixes, every peer with their IPs, speed and policy, and its local facilities. A facility shows its address and contacts plus the exchanges and networks there. An organization lists its networks, exchanges and facilities.
+- **Exchange IP addresses:** looking up a peering IP finds the network that holds it, says which exchange and port speed, and highlights that row. Handy for an unfamiliar BGP neighbor.
+- **Search:** any other text searches network, exchange, facility and organization names (up to 25 matches of each). A single match opens straight away; otherwise double-click one.
+- **Links:** **View on PeeringDB ↗** opens the record on peeringdb.com. Inside the results, PeeringDB names (the organization, an exchange or facility row) open here, and **◀ Back** returns to the previous record. Websites, looking glasses and e-mail addresses open in your browser or mail app.
+- **Tables:** sort by clicking a heading, drag the grip under a table to resize it, and use **Copy** for an aligned text table. Double-click a row to open it. Right-click a row to open it here or on peeringdb.com, Whois or IRR / RPKI the ASN, ping or copy the IP addresses, or send any cell to another tool. **Copy all** copies the whole record as text.
+- **API key (optional):** PeeringDB works without an account, but anonymous queries are rate-limited and some contacts are only shown to logged-in users. Paste a free API key from your PeeringDB profile ([how to get one](https://docs.peeringdb.com/howto/api_keys/)) to raise the limit and see those contacts. The key is saved in `settings.json` and only ever sent to PeeringDB over verified HTTPS. If the rate limit is reached, the tool says so: wait a minute or add a key.
+- **Send to:** right-click text anywhere and send it to PeeringDB. A PeeringDB link, an ASN (e.g. from `remote-as 10279`), or an IP address in the text is picked out and looked up.
 
 ## Text and log tools
 
@@ -419,8 +448,9 @@ Brian's Tools has no account, no telemetry and no ads. It only goes online when 
 
 | Tool | Contacts |
 |---|---|
-| Whois | ARIN Whois-RWS and RDAP (`whois.arin.net`, `rdap.arin.net`), the other registries' RDAP servers, IANA's RDAP list (`data.iana.org`), and domain registries' RDAP / WHOIS servers |
+| Whois | [Team Cymru](https://www.team-cymru.com) (`whois.cymru.com` on TCP port 43, or DNS TXT lookups under `asn.cymru.com` through your resolver) for IPs and ASNs by default; with the ARIN source, ARIN Whois-RWS and RDAP (`whois.arin.net`, `rdap.arin.net`) and the other registries' RDAP servers; ARIN for ARIN handles; IANA's RDAP list (`data.iana.org`) and domain registries' RDAP / WHOIS servers for domain names |
 | IRR / RPKI | Your chosen IRR server (default `whois.radb.net`, port 43); the RPKI VRP list (default `rpki.cloudflare.com`); with the wider option, RIPEstat (`stat.ripe.net`) and ARIN |
+| PeeringDB | The PeeringDB API (`www.peeringdb.com/api`, HTTPS), with your API key if you enter one |
 | MAC Lookup | `standards-oui.ieee.org` (only when downloading oui.txt) |
 | DNS Digr | The DNS servers you choose (your system's, a public resolver, or the root servers for a trace) |
 | Ping, Ping Sweep, Traceroute | Only the addresses you enter, using your system's own `ping` / `traceroute` / `tracert` |

@@ -170,12 +170,15 @@ def trust_source() -> str:
 
 
 def fetch_url(url: str, accept: str = "application/json", timeout: float = 15.0,
-              cache: Optional[dict] = None, source: str = "ARIN") -> dict:
-    """GET a JSON document. Raises WhoisError (with a 'not_found' flag for 404s)."""
+              cache: Optional[dict] = None, source: str = "ARIN", headers: Optional[dict] = None) -> dict:
+    """GET a JSON document. Raises WhoisError (with a 'not_found' flag for 404s and the HTTP status as
+    'status'). Extra `headers` (e.g. an API key) turn off the unverified-HTTPS / plain-HTTP fallback, so a
+    credential is never sent over a connection that isn't verified."""
     global _ssl_fallback_used
     if cache is not None and url in cache:
         return cache[url]
-    req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": USER_AGENT})
+    secret = bool(headers)
+    req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": USER_AGENT, **(headers or {})})
     try:
         try:
             ctx = trusted_context() if url.startswith("https://") else None
@@ -185,7 +188,7 @@ def fetch_url(url: str, accept: str = "application/json", timeout: float = 15.0,
             # Verified HTTPS failed even with the local certificate store (e.g. no roots could be loaded, or
             # an intercepting proxy we don't trust). Whois/RDAP data is public: retry over HTTPS without
             # verifying, then plain HTTP, rather than failing outright.
-            if (isinstance(exc, urllib.error.HTTPError) or not url.startswith("https://")
+            if (secret or isinstance(exc, urllib.error.HTTPError) or not url.startswith("https://")
                     or not isinstance(getattr(exc, "reason", None), ssl.SSLError)):
                 raise
             _ssl_fallback_used = True
@@ -202,6 +205,7 @@ def fetch_url(url: str, accept: str = "application/json", timeout: float = 15.0,
     except urllib.error.HTTPError as exc:
         err = WhoisError("No record found" if exc.code == 404 else f"{source} returned HTTP {exc.code}")
         err.not_found = exc.code == 404
+        err.status = exc.code
         raise err from None
     except urllib.error.URLError as exc:
         raise WhoisError(f"Couldn't reach {source} ({exc.reason})") from None

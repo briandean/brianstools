@@ -30,9 +30,9 @@ page = helpgen.build()
 print(f"Help compiled: {page.relative_to(here)} ({page.stat().st_size // 1024} KB)")
 
 if sys.platform == "darwin":
-    name, icon, mode = "Brian's Tools", "icon.icns", "--onedir"   # .app bundle
+    name, icon, mode = version.BUILD_NAME, "icon.icns", "--onedir"   # .app bundle
 elif sys.platform == "win32":
-    name, icon, mode = "Brian's Tools", "icon.ico", "--onefile"
+    name, icon, mode = version.BUILD_NAME, "icon.ico", "--onefile"
 else:
     name, icon, mode = "brians-tools", None, "--onefile"
 

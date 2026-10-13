@@ -1453,7 +1453,7 @@ class VersionTests(unittest.TestCase):
         text = version.windows_version_resource()
         ast.parse(text)                                           # PyInstaller evals this
         self.assertIn(version.VERSION, text)
-        self.assertIn("Brian's Tools.exe", text)
+        self.assertIn(version.BUILD_NAME + ".exe", text)
 
 
 class HelpGenTests(unittest.TestCase):
@@ -1486,6 +1486,348 @@ class HelpGenTests(unittest.TestCase):
         self.assertIn(version.WEBSITE, page)
         self.assertNotIn("{{", page)
         self.assertIn("Keyboard shortcuts", page)
+
+
+BULK_SAMPLE = """Bulk mode; whois.cymru.com [2026-10-12 14:02:11 +0000]
+15169   | 8.8.8.8          | 8.8.8.0/24          | US | arin     | 2023-12-28 | GOOGLE - Google LLC, US
+15169   | 8.8.8.0          | 8.8.8.0/24          | US | arin     | 2023-12-28 | GOOGLE - Google LLC, US
+NA      | 192.0.2.77       | NA                  |    | other    |            | NA
+13335   | 203.0.113.9      | 203.0.113.0/24      | AU | apnic    | 2011-08-11 | CLOUDFLARENET - Cloudflare, Inc., US
+64500   | 203.0.113.9      | 203.0.113.0/24      | AU | apnic    | 2011-08-11 | EXAMPLE-AS - Example, US
+15169   | 2001:4860:4860::8888 | 2001:4860::/32   | US | arin     | 2005-03-14 | GOOGLE - Google LLC, US
+15169   | US | arin     | 2000-03-30 | GOOGLE - Google LLC, US
+3356    | US | arin     | 2000-03-10 | LEVEL3 - Level 3 Parent, LLC, US
+4294967 |    |          |            | NA
+"""
+
+
+class CymruTests(unittest.TestCase):
+    def test_query_key(self):
+        import cymru
+        self.assertEqual(cymru.query_key("AS15169"), ("asn", "15169"))
+        self.assertEqual(cymru.query_key("as 15169"), ("asn", "15169"))
+        self.assertEqual(cymru.query_key("AS1.10"), ("asn", "65546"))
+        self.assertEqual(cymru.query_key("8.8.8.0/24"), ("ip", "8.8.8.0"))
+        self.assertEqual(cymru.query_key("2001:DB8::1"), ("ip", "2001:db8::1"))
+        with self.assertRaises(cymru.CymruError):
+            cymru.query_key("NET-8-8-8-0-2")
+
+    def test_build_and_parse(self):
+        import cymru
+        self.assertEqual(cymru.build_bulk([("ip", "8.8.8.8"), ("asn", "15169")]),
+                         b"begin\nverbose\n8.8.8.8\nAS15169\nend\n")
+        ips, asns, errs = cymru.parse_bulk(BULK_SAMPLE + "Error: no ASN or IP match on line 9.\n")
+        self.assertEqual(set(ips), {"8.8.8.8", "8.8.8.0", "192.0.2.77", "203.0.113.9", "2001:4860:4860::8888"})
+        self.assertEqual(len(ips["203.0.113.9"]), 2)
+        self.assertEqual(set(asns), {"15169", "3356", "4294967"})
+        self.assertEqual(len(errs), 1)
+        r = cymru.record_from_ip_rows("8.8.8.8", ips["8.8.8.8"])
+        self.assertEqual((r.origin, r.prefix, r.cc, r.registry_name, r.allocated, r.as_name),
+                         ("AS15169", "8.8.8.0/24", "US", "ARIN", "2023-12-28", "GOOGLE - Google LLC, US"))
+        moas = cymru.record_from_ip_rows("203.0.113.9", ips["203.0.113.9"])
+        self.assertEqual(moas.origin, "AS13335 / AS64500")
+        self.assertIn("Multiple origins", moas.note)
+        dark = cymru.record_from_ip_rows("192.0.2.77", ips["192.0.2.77"])
+        self.assertFalse(dark.announced)
+        self.assertIn("Not announced", dark.note)
+        self.assertEqual(dark.prefix, "")
+        a = cymru.record_from_asn_rows("AS3356", asns["3356"])
+        self.assertEqual((a.asn, a.as_name, a.registry_name), ("3356", "LEVEL3 - Level 3 Parent, LLC, US", "ARIN"))
+        self.assertTrue(cymru.record_from_asn_rows("AS4294967", asns["4294967"]).error)
+
+    def _server(self, reply: str):
+        import socket
+        import threading
+        srv = socket.socket()
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(5)
+        got = []
+
+        def serve():
+            while True:
+                try:
+                    c, _ = srv.accept()
+                except OSError:
+                    return
+                data = b""
+                while not data.endswith(b"end\n"):
+                    chunk = c.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                got.append(data.decode())
+                c.sendall(reply.encode())
+                c.close()
+        threading.Thread(target=serve, daemon=True).start()
+        self.addCleanup(srv.close)
+        return srv.getsockname()[1], got
+
+    def test_whois_bulk_against_mock(self):
+        import cymru
+        port, got = self._server(BULK_SAMPLE)
+        qs = ["8.8.8.8", "8.8.8.0/24", "AS15169", "15169", "2001:4860:4860::8888", "198.51.100.1", "bogus!"]
+        out = cymru.whois_bulk(qs, host="127.0.0.1", port=port, timeout=5)
+        self.assertEqual(len(got), 1)                          # one connection for the whole list
+        self.assertEqual(got[0].count("8.8.8.0"), 1)
+        self.assertEqual(got[0].count("AS15169"), 1)           # duplicates asked once
+        self.assertEqual(out["8.8.8.8"].origin, "AS15169")
+        self.assertEqual(out["8.8.8.0/24"].prefix, "8.8.8.0/24")
+        self.assertIn("first address", out["8.8.8.0/24"].note)
+        self.assertEqual(out["15169"].as_name, "GOOGLE - Google LLC, US")
+        self.assertEqual(out["2001:4860:4860::8888"].prefix, "2001:4860::/32")
+        self.assertTrue(out["198.51.100.1"].error)
+        self.assertTrue(out["bogus!"].error)
+
+    def test_auto_falls_back_to_dns(self):
+        import cymru
+        answers = {
+            "8.8.8.8.origin.asn.cymru.com": ["15169 | 8.8.8.0/24 | US | arin | 2023-12-28",
+                                             "15169 | 8.0.0.0/9 | US | arin | 1992-12-01"],
+            "AS15169.asn.cymru.com": ["15169 | US | arin | 2000-03-30 | GOOGLE - Google LLC, US"],
+            "AS13335.asn.cymru.com": ["13335 | US | arin | 2010-07-14 | CLOUDFLARENET - Cloudflare, Inc., US"],
+            "AS64500.asn.cymru.com": ["64500 | US | arin | 2010-07-14 | EXAMPLE"],
+            "1.1.1.1.origin.asn.cymru.com": ["13335 64500 | 1.1.1.0/24 | AU | apnic | 2011-08-11"],
+        }
+        asked = []
+
+        def resolver(name, server, timeout):
+            asked.append(name)
+            return answers.get(name, [])
+
+        def refuse(addr, timeout=None):
+            raise ConnectionRefusedError(111, "Connection refused")
+        out, note = cymru.lookup_many(["8.8.8.8", "AS15169", "1.1.1.1", "192.0.2.1"], via="auto",
+                                      connect=refuse, resolver=resolver, dns_server="192.0.2.53")
+        self.assertIn("used DNS", note)
+        r = out["8.8.8.8"]
+        self.assertEqual((r.prefix, r.as_name, r.source), ("8.8.8.0/24", "GOOGLE - Google LLC, US", "DNS"))
+        self.assertEqual(out["AS15169"].allocated, "2000-03-30")
+        self.assertEqual(out["1.1.1.1"].origin, "AS13335 / AS64500")
+        self.assertFalse(out["192.0.2.1"].announced)
+        self.assertEqual(asked.count("AS15169.asn.cymru.com"), 1)          # AS names cached
+        out, note = cymru.lookup_many(["8.8.8.8"], via="whois", connect=refuse)
+        self.assertTrue(out["8.8.8.8"].error)
+        calls = []
+
+        def dead(name, server, timeout):
+            calls.append(name)
+            raise OSError("no reply")
+        out, note = cymru.lookup_many([f"8.8.8.{i}" for i in range(10)], via="dns", resolver=dead, dns_server="x")
+        self.assertEqual(len(calls), 1)                                    # the sanity check fails: stop there
+        self.assertTrue(all(r.error for r in out.values()))
+        self.assertIn("DNS lookup failed", note)
+        out, note = cymru.lookup_many(["8.8.8.8", "AS3356"], via="dns", resolver=lambda *a: [], dns_server="x")
+        self.assertTrue(all("can't be trusted" in r.error for r in out.values()))   # filtered resolver
+        flaky = {"n": 0}
+
+        def some_dead(name, server, timeout):
+            if name == "AS15169.asn.cymru.com":
+                return ["15169 | US | arin | 2000-03-30 | GOOGLE - Google LLC, US"]
+            flaky["n"] += 1
+            raise OSError("no reply")
+        out, _ = cymru.lookup_many([f"8.8.8.{i}" for i in range(10)], via="dns", resolver=some_dead, dns_server="x")
+        self.assertEqual(flaky["n"], 3)                                    # gives up after 3 dead queries
+
+    def test_origin6_and_format(self):
+        import cymru
+        n = cymru.origin_name("2001:db8::1")
+        self.assertTrue(n.startswith("1.0.0.0.") and n.endswith("8.b.d.0.1.0.0.2.origin6.asn.cymru.com"))
+        self.assertEqual(len(n.split(".")), 32 + 4)
+        rec = cymru.CymruRecord(query="8.8.8.8", kind="ip", asns=["15169"], prefix="8.8.8.0/24", cc="US",
+                                registry="arin", allocated="2023-12-28", as_name="GOOGLE", source="whois")
+        text = cymru.format_record(rec)
+        self.assertIn("AS15169", text)
+        self.assertIn("8.8.8.0/24", text)
+
+
+def pdb_fixture():
+    """A small fake PeeringDB: path -> rows, built from AS10279's public record."""
+    net = {"id": 20321, "org_id": 27000, "name": "West Carolina Communications",
+           "aka": "West Carolina Telephone, WCFIBER/UPCOUNTRY FIBER", "name_long": "", "website": "http://www.wctel.com",
+           "social_media": [], "asn": 10279, "looking_glass": "", "route_server": "", "irr_as_set": "AS-WCCOM",
+           "info_type": "NSP", "info_types": ["NSP"], "info_prefixes4": 142, "info_prefixes6": 0, "info_traffic": "",
+           "info_ratio": "Mostly Inbound", "info_scope": "Regional", "info_unicast": True, "info_multicast": False,
+           "info_ipv6": False, "info_never_via_route_servers": False, "notes": "",
+           "netixlan_updated": "2024-07-24T16:31:39Z", "netfac_updated": "2022-08-24T19:17:49Z",
+           "poc_updated": "2026-10-06T17:11:30Z", "policy_url": "", "policy_general": "Selective",
+           "policy_locations": "Not Required", "policy_ratio": False, "policy_contracts": "Not Required",
+           "netfac_set": [
+               {"id": 1, "name": "Digital Realty CLT (113 N Myers St)", "city": "Charlotte", "country": "US",
+                "fac_id": 501, "local_asn": 10279},
+               {"id": 2, "name": "CoreSite - Atlanta (AT1)", "city": "Atlanta", "country": "US", "fac_id": 502,
+                "local_asn": 10279}],
+           "netixlan_set": [{"id": 9, "ix_id": 800, "name": "Digital Realty Atlanta", "ixlan_id": 801, "speed": 100000,
+                             "asn": 10279, "ipaddr4": "206.126.110.58", "ipaddr6": "2001:504:17:110::58",
+                             "is_rs_peer": False, "bfd_support": False, "operational": True, "net_side_id": 502}],
+           "poc_set": [{"id": 3, "role": "NOC", "visible": "Public", "name": "NOC", "phone": "",
+                        "email": "noc@wctel.com", "url": ""}],
+           "status_dashboard": "", "rir_status": "ok", "rir_status_updated": "2024-06-26T04:47:55Z",
+           "updated": "2026-10-06T17:11:31Z", "status": "ok"}
+    org = {"id": 27000, "name": "West Carolina Communications, LLC", "website": "", "aka": "", "name_long": "",
+           "address1": "233 Highway 28 Bypass", "city": "Abbeville", "state": "SC", "zipcode": "29620",
+           "country": "US", "updated": "2026-01-01T00:00:00Z"}
+    ix = {"id": 800, "org_id": 27001, "name": "Digital Realty Atlanta", "city": "Atlanta", "country": "US",
+          "region_continent": "North America", "media": "Ethernet", "proto_unicast": True, "proto_ipv6": True,
+          "proto_multicast": False, "tech_email": "noc@example.net", "website": "https://example.net"}
+    other = dict(net, id=555, name="Example Transit", asn=64500, org_id=27001, netixlan_set=[], netfac_set=[],
+                 poc_set=[], policy_general="Open")
+    routes = {
+        ("net", (("asn", "10279"), ("depth", "2"))): [net],
+        ("net/20321", (("depth", "2"),)): [net],
+        ("net/555", (("depth", "2"),)): [other],
+        ("org/27000", (("depth", "0"),)): [org],
+        ("org/27001", (("depth", "0"),)): [{"id": 27001, "name": "Digital Realty"}],
+        ("netixlan", (("ipaddr4", "206.126.110.58"),)): [dict(net["netixlan_set"][0], net_id=20321)],
+        ("netixlan", (("ipaddr6", "2001:504:17:110::58"),)): [dict(net["netixlan_set"][0], net_id=20321)],
+        ("ix/800", (("depth", "0"),)): [ix],
+        ("netixlan", (("ix_id", "800"), ("limit", "5000"))): [
+            dict(net["netixlan_set"][0], net_id=20321),
+            {"net_id": 555, "asn": 64500, "ipaddr4": "206.126.110.9", "ipaddr6": None, "speed": 400000,
+             "is_rs_peer": True, "bfd_support": True}],
+        ("net", (("ix_id", "800"), ("limit", "5000"))): [net, other],
+        ("ixfac", (("ix_id", "800"),)): [{"fac_id": 502, "name": "CoreSite - Atlanta (AT1)", "city": "Atlanta",
+                                         "country": "US"}],
+        ("ixlan", (("depth", "2"), ("ix_id", "800"))): [{"id": 801, "mtu": 1500, "dot1q_support": False,
+                                                          "ixpfx_set": [{"protocol": "IPv4",
+                                                                         "prefix": "206.126.110.0/23",
+                                                                         "in_dfz": True}]}],
+        ("net", (("limit", "25"), ("name__contains", "carolina"))): [net],
+        ("ix", (("limit", "25"), ("name__contains", "carolina"))): [],
+        ("fac", (("limit", "25"), ("name__contains", "carolina"))): [],
+        ("org", (("limit", "25"), ("name__contains", "carolina"))): [org],
+    }
+    return routes
+
+
+def pdb_fake_fetch(routes, seen=None):
+    import arinwhois
+    import urllib.parse
+
+    def fetch(url, accept, timeout, cache, source, headers=None):
+        if seen is not None:
+            seen.append((url, headers))
+        u = urllib.parse.urlsplit(url)
+        path = u.path.split("/api/", 1)[1]
+        key = (path, tuple(sorted(urllib.parse.parse_qsl(u.query))))
+        if key not in routes:
+            if path.split("/")[0] in ("net", "ix", "fac", "org") and "/" in path:
+                return {"data": []}
+            if path in ("netixlan", "net", "ix", "fac", "org", "ixfac", "netfac", "ixlan"):
+                return {"data": []}
+            err = arinwhois.WhoisError("No record found")
+            err.not_found, err.status = True, 404
+            raise err
+        return {"data": routes[key]}
+    return fetch
+
+
+class PeeringDBTests(unittest.TestCase):
+    def client(self, key="", seen=None):
+        import peeringdb
+        return peeringdb.Client(api_key=key, base="https://pdb.test/api", fetch=pdb_fake_fetch(pdb_fixture(), seen))
+
+    def test_classify(self):
+        import peeringdb as p
+        self.assertEqual(p.classify("https://www.peeringdb.com/net/20321"), ("net", 20321))
+        self.assertEqual(p.classify("peeringdb.com/ix/26"), ("ix", 26))
+        self.assertEqual(p.classify("fac 501"), ("fac", 501))
+        self.assertEqual(p.classify("AS10279"), ("asn", 10279))
+        self.assertEqual(p.classify(" 10279 "), ("asn", 10279))
+        self.assertEqual(p.classify("AS1.10"), ("asn", 65546))
+        self.assertEqual(p.classify("206.126.110.58"), ("ip", "206.126.110.58"))
+        self.assertEqual(p.classify("2001:504:17:110::58"), ("ip", "2001:504:17:110::58"))
+        self.assertEqual(p.classify("west carolina"), ("search", "west carolina"))
+        self.assertEqual(p.classify("   "), ("", ""))
+
+    def test_speed_and_country(self):
+        import peeringdb as p
+        self.assertEqual([p.speed(x) for x in (100, 1000, 10000, 100000, 400000, 1200000, None)],
+                         ["100M", "1G", "10G", "100G", "400G", "1.2T", ""])
+        self.assertEqual(p.country("us"), "United States of America")
+        self.assertEqual(p.country("ZZ"), "ZZ")
+
+    def test_network_by_asn(self):
+        import peeringdb as p
+        seen = []
+        rec = p.load(self.client(seen=seen), "asn", 10279)
+        self.assertEqual((rec.kind, rec.title, rec.url), ("net", "West Carolina Communications",
+                                                          "https://www.peeringdb.com/net/20321"))
+        f = {x.label: x for x in rec.main[0].fields}
+        labels = [x.label for x in rec.main[0].fields]
+        self.assertEqual(labels[:3], ["Organization", "Also Known As", "Long Name"])
+        self.assertEqual(f["Organization"].value, "West Carolina Communications, LLC")
+        self.assertEqual(f["Organization"].link, "pdb:org/27000")
+        self.assertEqual(f["Company Website Override"].link, "http://www.wctel.com")
+        self.assertEqual(f["IRR as-set"].value, "AS-WCCOM")
+        self.assertEqual(f["Traffic Levels"].value, "Not Disclosed")
+        self.assertIn("☑ Unicast IPv4", f["Protocols Supported"].value)
+        self.assertIn("☐ IPv6", f["Protocols Supported"].value)
+        pol = {x.label: x.value for x in rec.side[0].fields}
+        self.assertEqual((pol["General Policy"], pol["Ratio Requirement"]), ("Selective", "No"))
+        cols, rows = rec.side[1].table
+        self.assertEqual(rows, [["NOC", "NOC", "Public", "", "noc@wctel.com"]])
+        self.assertIn("API key", rec.side[1].note)
+        ixt, fact = rec.tables
+        self.assertEqual(ixt.rows[0][:6], ["Digital Realty Atlanta", "10279", "206.126.110.58",
+                                           "2001:504:17:110::58", "100G", "CoreSite - Atlanta (AT1)"])
+        self.assertEqual(ixt.targets, ["pdb:ix/800"])
+        self.assertEqual([r[0] for r in fact.rows], ["CoreSite - Atlanta (AT1)", "Digital Realty CLT (113 N Myers St)"])
+        self.assertEqual(fact.rows[0][2], "United States of America")
+        self.assertTrue(all(h is None for _, h in seen))                  # no key: no Authorization header
+        text = p.record_text(rec)
+        self.assertIn("IRR as-set", text)
+        self.assertIn("Interconnection Facilities (2)", text)
+
+    def test_api_key_header_and_errors(self):
+        import arinwhois
+        import peeringdb as p
+        seen = []
+        c = self.client(key=" abc123 ", seen=seen)
+        rec = p.load(c, "net", 20321)
+        self.assertEqual(seen[0][1], {"Authorization": "Api-Key abc123"})
+        self.assertEqual(rec.side[1].note, "")
+        calls = c.calls
+        p.load(c, "net", 20321)
+        self.assertEqual(c.calls, calls)                                   # cached
+        with self.assertRaises(p.PdbError) as cm:
+            p.load(self.client(), "asn", 64999)
+        self.assertTrue(cm.exception.not_found)
+
+        def limited(*a, **k):
+            e = arinwhois.WhoisError("PeeringDB returned HTTP 429")
+            e.status = 429
+            raise e
+        with self.assertRaises(p.PdbError) as cm:
+            p.Client(fetch=limited).get("net", asn=1)
+        self.assertIn("rate limit", str(cm.exception))
+        self.assertIn("API key", str(cm.exception))
+
+    def test_ip_ix_search_org(self):
+        import peeringdb as p
+        rec = p.load(self.client(), "ip", "2001:504:17:110::58")
+        self.assertEqual(rec.tables[0].highlight, 0)
+        self.assertIn("AS10279 West Carolina Communications on Digital Realty Atlanta (100G)", rec.note)
+        with self.assertRaises(p.PdbError):
+            p.load(self.client(), "ip", "192.0.2.1")
+        ix = p.load(self.client(), "ix", 800)
+        self.assertEqual(ix.url, "https://www.peeringdb.com/ix/800")
+        peers = ix.tables[0]
+        self.assertEqual([r[0] for r in peers.rows], ["Example Transit", "West Carolina Communications"])
+        self.assertEqual(peers.rows[0][4:], ["400G", "Open", "Yes", "Yes"])
+        self.assertEqual(peers.targets[1], "pdb:net/20321")
+        self.assertTrue(any(s.title == "Prefixes" for s in ix.side))
+        found = p.load(self.client(), "search", "carolina")
+        self.assertEqual([r[:2] for r in found.tables[0].rows],
+                         [["Network", "West Carolina Communications"], ["Organization", "West Carolina Communications, LLC"]])
+        self.assertEqual(found.tables[0].targets, ["pdb:net/20321", "pdb:org/27000"])
+        org = p.load(self.client(), "org", 27000)
+        self.assertIn("Abbeville, SC 29620", [f for f in org.main[0].fields if f.label == "Address"][0].value)
+
+    def test_no_insecure_fallback_with_key(self):
+        import inspect
+        import arinwhois
+        src = inspect.getsource(arinwhois.fetch_url)
+        self.assertIn("secret or isinstance(exc, urllib.error.HTTPError)", src)
 
 
 if __name__ == "__main__":

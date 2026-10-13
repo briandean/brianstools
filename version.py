@@ -4,9 +4,10 @@ Versions are pre-1.0 and date-based: 0.YYYY.MMDD (e.g. 0.2026.1011 = 11 October 
 numbers, so the same string works as a macOS bundle version and a Windows file version.
 """
 APP_NAME = "Brian's Tools"
+BUILD_NAME = "Brian's Tools"                # app / .exe file name
 TAGLINE = "Network Toolbox"
-VERSION = "0.2026.1011"
-RELEASE_DATE = "2026-10-11"
+VERSION = "0.2026.1012.2"
+RELEASE_DATE = "2026-10-12"
 WEBSITE = "https://brianstools.net"
 WEBSITE_LABEL = "brianstools.net"
 USER_AGENT = f"BriansTools/{VERSION} (+{WEBSITE})"
@@ -39,7 +40,7 @@ def windows_version_resource() -> str:
       StringStruct('FileDescription', {APP_NAME!r}),
       StringStruct('FileVersion', {dotted!r}),
       StringStruct('InternalName', 'BriansTools'),
-      StringStruct('OriginalFilename', {APP_NAME + '.exe'!r}),
+      StringStruct('OriginalFilename', {BUILD_NAME + '.exe'!r}),
       StringStruct('ProductName', {APP_NAME!r}),
       StringStruct('ProductVersion', {VERSION!r}),
       StringStruct('Comments', {WEBSITE!r})])]),

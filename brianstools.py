@@ -20,6 +20,8 @@ from pathlib import Path
 from tkinter import ttk
 
 import arinwhois
+import cymru
+import peeringdb
 import badge
 import bwcost
 import asnsources
@@ -215,7 +217,7 @@ class AutoScrollbar(ttk.Scrollbar):
         super().set(first, last)
 
 
-def make_tree(parent, columns, widths) -> ttk.Treeview:
+def make_tree(parent, columns, widths, sizer=True) -> ttk.Treeview:
     """A Treeview with a vertical scrollbar and a horizontal one that appears when the columns are wider
     than the table. Columns never shrink below their set width (they scroll instead), and the table
     doesn't make the whole page wider: it scrolls sideways on its own."""
@@ -243,6 +245,9 @@ def make_tree(parent, columns, widths) -> ttk.Treeview:
     def sync():
         try:
             h = tree.winfo_reqheight() + (hs.winfo_reqheight() if hs.winfo_ismapped() else 0)
+            grip = getattr(tree, "grip", None)
+            if grip is not None:
+                h += grip.winfo_reqheight()
             if int(frame.cget("height")) != h:
                 frame.configure(height=h)
             job["id"] = frame.after(300, sync)
@@ -257,11 +262,226 @@ def make_tree(parent, columns, widths) -> ttk.Treeview:
                 pass
             job["id"] = None
 
+    def sync_now():
+        try:
+            h = tree.winfo_reqheight() + (hs.winfo_reqheight() if hs.winfo_ismapped() else 0)
+            grip = getattr(tree, "grip", None)
+            if grip is not None:
+                h += grip.winfo_reqheight()
+            frame.configure(height=h)
+        except tk.TclError:
+            pass
+
     frame.bind("<Destroy>", stop, add="+")
     sync()
     tree.container = frame  # type: ignore[attr-defined]
     tree.hbar = hs          # type: ignore[attr-defined]
+    tree.sync_height = sync_now  # type: ignore[attr-defined]
+    if sizer:
+        frame.after_idle(lambda: BoxSizer.auto(tree, frame))
     return tree
+
+
+def _owner_tab(widget):
+    """The tool tab a widget belongs to (None inside a dialog window)."""
+    w = widget.master
+    while w is not None:
+        if isinstance(w, tk.Toplevel):
+            return None
+        if isinstance(w, ttk.Frame) and type(w).__name__.endswith("Tab") and hasattr(w, "app"):
+            return w
+        w = w.master
+    return None
+
+
+class BoxSizer:
+    """A grip along the bottom of a text box or table: drag it to make the box taller or shorter.
+    Double-click it to go back to the automatic height. Heights are saved (in lines / rows, so they
+    follow the text size) under "box_heights" in settings.json."""
+
+    MIN_UNITS, MAX_UNITS = 2, 300
+
+    @classmethod
+    def auto(cls, target, container):
+        """Add a grip if `target` is in a tool tab (dialogs resize with their window instead)."""
+        try:
+            if getattr(target, "grip", None) is not None or not target.winfo_exists():
+                return None
+        except tk.TclError:
+            return None
+        tab = _owner_tab(target)
+        if tab is None:
+            return None
+        return cls(tab.app, container, [target], key=cls._key_for(tab, target))
+
+    @staticmethod
+    def _key_for(tab, target):
+        for name, val in vars(tab).items():
+            if val is target:
+                return f"{type(tab).__name__}.{name}"
+            if isinstance(val, (list, tuple)):
+                for i, v in enumerate(val):
+                    if v is target:
+                        return f"{type(tab).__name__}.{name}{i}"
+        return None                               # made on the fly: resizable, but not remembered
+
+    def __init__(self, app, container, targets, key=None):
+        self.app, self.container, self.targets, self.key = app, container, list(targets), key
+        self.lock = None                          # how the box stretched before the user sized it
+        self.user_sized = False
+        self.default_units = self._units()
+        self.drag = None
+        g = self.grip = ttk.Frame(container, style="Grip.TFrame", height=9, cursor="sb_v_double_arrow")
+        self.bar = ttk.Frame(g, style="GripBar.TFrame", width=40, height=3, cursor="sb_v_double_arrow")
+        self.bar.place(relx=0.5, rely=0.5, anchor="center")
+        if container.grid_slaves():
+            cols, rows = container.grid_size()
+            g.grid(row=rows, column=0, columnspan=max(1, cols), sticky="ew")
+        else:
+            g.pack(side="bottom", fill="x")
+        for t in self.targets:
+            t.grip = g
+            t.sizer = self
+        for w in (g, self.bar):
+            w.bind("<ButtonPress-1>", self._press)
+            w.bind("<B1-Motion>", self._motion)
+            w.bind("<ButtonRelease-1>", self._release)
+            w.bind("<Double-Button-1>", self._reset)
+            w.bind("<Enter>", lambda e: self.bar.configure(style="GripBarHot.TFrame"))
+            w.bind("<Leave>", lambda e: self.drag is None and self.bar.configure(style="GripBar.TFrame"))
+        container.bind("<Map>", self._mapped, add="+")
+        self._resync()
+        saved = (app.settings.get("box_heights") or {}).get(key) if key else None
+        if isinstance(saved, (int, float)) and saved >= self.MIN_UNITS:
+            self._unlock()
+            self._set_units(int(saved))
+
+    # ---- measuring (Text heights are in lines, Treeview heights in rows)
+
+    def _units(self):
+        try:
+            return int(self.targets[0].cget("height"))
+        except (tk.TclError, ValueError):
+            return 10
+
+    def _unit_px(self, t):
+        if isinstance(t, ttk.Treeview):
+            st = ttk.Style(t)
+            for name in (t.cget("style"), "Treeview"):
+                v = st.lookup(name, "rowheight") if name else ""
+                if v not in ("", None):
+                    try:
+                        return max(1, int(float(v)))
+                    except ValueError:
+                        pass
+            return 20
+        try:
+            return max(1, tkfont.Font(font=t.cget("font")).metrics("linespace"))
+        except tk.TclError:
+            return 16
+
+    def _set_units(self, n):
+        n = max(self.MIN_UNITS, min(self.MAX_UNITS, int(n)))
+        for t in self.targets:
+            try:
+                if int(t.cget("height")) != n:
+                    t.configure(height=n)
+            except tk.TclError:
+                pass
+        self._resync()
+
+    def _resync(self):
+        for t in self.targets:
+            f = getattr(t, "sync_height", None)
+            if f:
+                f()
+        w = self.container
+        while w is not None:                      # let the page's scroll area catch up right away
+            if isinstance(w, ScrollPage):
+                w._layout_soon()
+                break
+            w = w.master
+
+    # ---- stretching: a box the user has sized keeps that size instead of filling spare space
+
+    def _unlock(self):
+        """Stop the box stretching into spare space. Safe to repeat: a view that's packed again
+        (switching views re-applies expand) is caught when it's shown (<Map>)."""
+        self.user_sized = True
+        c = self.container
+        try:
+            mgr = c.winfo_manager()
+            if mgr == "pack":
+                expand = str(c.pack_info().get("expand")) in ("1", "true", "True")
+                if expand:
+                    c.pack_configure(expand=False)
+                if self.lock is None or expand:
+                    self.lock = ("pack", expand or (self.lock or ("pack", False))[1])
+            elif mgr == "grid":
+                info = c.grid_info()
+                master, row = info["in"], int(info["row"])
+                weight = master.grid_rowconfigure(row)["weight"]
+                if weight:
+                    master.grid_rowconfigure(row, weight=0)
+                if self.lock is None or weight:
+                    self.lock = ("grid", master, row, weight)
+        except (tk.TclError, KeyError, ValueError):
+            pass
+
+    def _mapped(self, e):
+        if e.widget is self.container and self.user_sized:
+            self._unlock()
+
+    def _relock(self):
+        lock, self.lock = self.lock, None
+        self.user_sized = False
+        try:
+            if lock and lock[0] == "pack" and lock[1]:
+                self.container.pack_configure(expand=True)
+            elif lock and lock[0] == "grid" and lock[3]:
+                lock[1].grid_rowconfigure(lock[2], weight=lock[3])
+        except tk.TclError:
+            pass
+
+    # ---- mouse
+
+    def _press(self, e):
+        t = self.targets[0]
+        unit = self._unit_px(t)
+        units = self._units()
+        extra = t.winfo_reqheight() - units * unit          # borders, padding, table heading
+        shown = (t.winfo_height() - extra) / unit if t.winfo_ismapped() else units
+        self._unlock()
+        start = max(self.MIN_UNITS, int(round(shown)))
+        self._set_units(start)                              # no jump when a stretched box is grabbed
+        self.drag = (e.y_root, start, unit)
+        self.bar.configure(style="GripBarHot.TFrame")
+        return "break"
+
+    def _motion(self, e):
+        if not self.drag:
+            return
+        y0, start, unit = self.drag
+        self._set_units(start + round((e.y_root - y0) / unit))
+        return "break"
+
+    def _release(self, e):
+        if not self.drag:
+            return
+        self.drag = None
+        self.bar.configure(style="GripBar.TFrame")
+        if self.key:
+            self.app.settings.setdefault("box_heights", {})[self.key] = self._units()
+        return "break"
+
+    def _reset(self, e=None):
+        self.drag = None
+        self._relock()
+        self._set_units(self.default_units)
+        if self.key:
+            (self.app.settings.get("box_heights") or {}).pop(self.key, None)
+        self.app.flash("Box height reset")
+        return "break"
 
 
 def autosize_columns(tree: ttk.Treeview, font, columns=None, max_px: int = 600, pad: int = 24):
@@ -620,10 +840,8 @@ class SummarizeTab(ttk.Frame):
 
         left = ttk.Frame(paned, padding=(0, 0, 8, 0))
         ttk.Label(left, text="Input", style="Title.TLabel").pack(anchor="w")
-        self.text = tk.Text(left, width=34, height=20, font=app.mono, undo=True, wrap="none",
-                            relief="solid", borderwidth=1)
-        self.text.pack(fill="both", expand=True, pady=4)
-        match_theme(app, self.text)
+        self.text = scrolled_text(left, app, width=34, height=20)
+        self.text.container.pack(fill="both", expand=True, pady=4)
         self.text.insert("1.0", app.settings.get("summary", DEFAULT_SUMMARY))
         ttk.Label(left, text="Lines starting with # are ignored. Commas also separate entries.",
                   style="Hint.TLabel", wraplength=280).pack(anchor="w")
@@ -1024,8 +1242,8 @@ class TimeZoneTab(ttk.Frame):
 # --------------------------------------------------------------------------- add / subtract time tab
 
 
-def link(parent, text, command) -> ttk.Label:
-    lbl = ttk.Label(parent, text=text, style="Link.TLabel", cursor="hand2")
+def link(parent, text, command, style="Link.TLabel") -> ttk.Label:
+    lbl = ttk.Label(parent, text=text, style=style, cursor="hand2")
     lbl.bind("<Button-1>", lambda e: command())
     return lbl
 
@@ -1399,9 +1617,10 @@ DEFAULT_MACS = """Paste MAC addresses, one per line, or any text that contains t
 """
 
 
-def scrolled_text(parent, app, **kw) -> tk.Text:
+def scrolled_text(parent, app, sizer=True, **kw) -> tk.Text:
     frame = ttk.Frame(parent)
-    text = tk.Text(frame, font=app.mono, wrap="none", undo=True, relief="solid", borderwidth=1, **kw)
+    kw.setdefault("wrap", "none")
+    text = tk.Text(frame, font=app.mono, undo=True, relief="solid", borderwidth=1, **kw)
     ys = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
     xs = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
     text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set)
@@ -1410,8 +1629,12 @@ def scrolled_text(parent, app, **kw) -> tk.Text:
     xs.grid(row=1, column=0, sticky="ew")
     frame.rowconfigure(0, weight=1)
     frame.columnconfigure(0, weight=1)
+    if kw["wrap"] != "none":
+        xs.grid_remove()                     # wrapped text never scrolls sideways
     text.container = frame
     match_theme(app, text)
+    if sizer:
+        frame.after_idle(lambda: BoxSizer.auto(text, frame))
     return text
 
 
@@ -1788,9 +2011,8 @@ class MacLookupTab(ttk.Frame):
             side="right", padx=4)
 
         ttk.Label(self, text="Selected", style="Key.TLabel").pack(anchor="w", pady=(8, 0))
-        self.detail = tk.Text(self, height=5, font=app.mono, wrap="word", relief="solid", borderwidth=1)
-        match_theme(app, self.detail)
-        self.detail.pack(fill="x")
+        self.detail = scrolled_text(self, app, height=5, wrap="word")
+        self.detail.container.pack(fill="x")
         self.detail.configure(state="disabled")
 
         self.debounce = Debouncer(self, 250, self.refresh)
@@ -3459,14 +3681,30 @@ class PingTab(ttk.Frame):
                 self.app.flash(f"Couldn't save: {exc}")
 
 
-# --------------------------------------------------------------------------- ARIN whois tab
+# --------------------------------------------------------------------------- whois tab (Team Cymru)
+
+
+def he_url(query: str, rec) -> str:
+    """Hurricane Electric's BGP Toolkit page for a Cymru answer."""
+    import urllib.parse
+    if rec.kind == "asn":
+        return f"https://bgp.he.net/AS{rec.asn}"
+    if "/" in query:
+        return "https://bgp.he.net/net/" + urllib.parse.quote(query, safe="/:")
+    return "https://bgp.he.net/ip/" + urllib.parse.quote(query, safe=":")
+
 
 
 class WhoisTab(ttk.Frame):
-    """IP / prefix / ASN lookups against ARIN's Whois-RWS REST API."""
+    """IP / prefix / ASN lookups. Source "cymru" (the default): Team Cymru's IP to ASN mapping service (whois
+    bulk mode on TCP 43, or DNS). Source "arin": ARIN's Whois-RWS, with the other registries via RDAP.
+    Domain names use RDAP / WHOIS either way; ARIN handles (NET-…, ORG-…) always go to ARIN."""
 
-    COLUMNS = ("Query", "Network", "Net name", "Organization", "Country", "Type", "Abuse email", "Notes")
-    MAX_LOOKUPS = 250
+    COLUMNS = ("Query", "Network", "Origin AS", "Owner", "Country", "Type", "Allocated", "Notes")
+    ARIN_COLUMNS = ("Query", "Network", "Net name", "Organization", "Country", "Type", "Abuse email", "Notes")
+    SOURCES = ("cymru", "arin")
+    MAX_LOOKUPS = 2000
+    VIA = (("auto", "Auto (whois, DNS if port 43 is blocked)"), ("whois", "whois (TCP 43)"), ("dns", "DNS"))
 
     def __init__(self, master, app: "App"):
         super().__init__(master, padding=12)
@@ -3474,6 +3712,9 @@ class WhoisTab(ttk.Frame):
         s = app.settings
         self.base = s.get("arin_base", arinwhois.BASE_URL)      # overrides only for testing
         self.rdap_base = s.get("rdap_base", arinwhois.RDAP_URL)
+        self.cymru_host = s.get("cymru_host", cymru.WHOIS_HOST)          # overrides only for testing
+        self.cymru_port = int(s.get("cymru_port", cymru.WHOIS_PORT))
+        self.cymru_dns = s.get("cymru_dns_server", "")                     # blank = this computer's resolver
         self.cache = {}
         self.results = {}
         self.worker = None
@@ -3502,15 +3743,33 @@ class WhoisTab(ttk.Frame):
         for text_, var in (("IP addresses / prefixes", self.do_ips_v), ("ASNs", self.do_asns_v),
                            ("Plain numbers in AS paths are ASNs", self.bare_v), ("Domain names", self.do_domains_v)):
             ttk.Checkbutton(what, text=text_, variable=var, command=self.highlight).pack(side="left", padx=(8, 4))
-        opt = ttk.Frame(self)
-        opt.pack(fill="x", pady=(4, 0))
+        src = ttk.Frame(self)
+        src.pack(fill="x", pady=(6, 0))
         self.contacts_v = tk.BooleanVar(value=s.get("whois_contacts", True))
         self.skip_v = tk.BooleanVar(value=s.get("whois_skip_private", True))
         self.rdap_v = tk.BooleanVar(value=s.get("whois_rdap", True))
-        ttk.Checkbutton(opt, text="Include contacts", variable=self.contacts_v).pack(side="left")
-        ttk.Checkbutton(opt, text="Skip private / reserved", variable=self.skip_v).pack(side="left", padx=12)
-        ttk.Checkbutton(opt, text="Get owners from other registries (RIPE, APNIC, LACNIC, AFRINIC via RDAP)",
-                        variable=self.rdap_v).pack(side="left")
+        source = s.get("whois_source", "cymru")
+        self.source_v = tk.StringVar(value=source if source in self.SOURCES else "cymru")
+        ttk.Label(src, text="Source:", style="Field.TLabel").pack(side="left")
+        ttk.Radiobutton(src, text="Ask", value="cymru", variable=self.source_v,
+                        command=self.source_changed).pack(side="left", padx=(8, 0))
+        link(src, "Team Cymru", lambda: __import__("webbrowser").open(cymru.WEBSITE),
+             style="FieldLink.TLabel").pack(side="left", padx=(2, 4))
+        ttk.Label(src, text="via").pack(side="left")
+        names = dict(self.VIA)
+        self.via_v = tk.StringVar(value=names.get(s.get("whois_via", "auto"), names["auto"]))
+        self.via_box = ttk.Combobox(src, textvariable=self.via_v, values=list(names.values()), state="readonly",
+                                    width=36)
+        self.via_box.pack(side="left", padx=(4, 20))
+        ttk.Radiobutton(src, text="ARIN and the other registries (RDAP)", value="arin", variable=self.source_v,
+                        command=self.source_changed).pack(side="left")
+        opt = ttk.Frame(self)
+        opt.pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(opt, text="Skip private / reserved", variable=self.skip_v).pack(side="left")
+        self.contacts_cb = ttk.Checkbutton(opt, variable=self.contacts_v)
+        self.contacts_cb.pack(side="left", padx=12)
+        self.rdap_cb = ttk.Checkbutton(opt, text="Get owners from other registries (RIPE, APNIC, LACNIC, AFRINIC)",
+                                       variable=self.rdap_v)
         self.stop_btn = ttk.Button(opt, text="Stop", command=self.stop, state="disabled")
         self.stop_btn.pack(side="right")
         self.go_btn = ttk.Button(opt, text="Look up", style="Accent.TButton", command=self.start)
@@ -3534,7 +3793,7 @@ class WhoisTab(ttk.Frame):
         self.path_text.tag_configure("asn", font=app.mono)
         self.paths = []
 
-        self.col_widths = (115, 115, 110, 160, 62, 120, 170, 120)
+        self.col_widths = (115, 130, 90, 220, 62, 120, 90, 160)
         self.tree = make_tree(self, self.COLUMNS, self.col_widths)
         self._autosize_job = None
         self.tree.configure(height=9, selectmode="browse")
@@ -3552,17 +3811,33 @@ class WhoisTab(ttk.Frame):
         dh.pack(fill="x", pady=(10, 0))
         ttk.Label(dh, text="Details", style="Title.TLabel").pack(side="left")
         ttk.Button(dh, text="Copy details", style="Small.TButton", command=self.copy_detail).pack(side="right")
-        self.web_btn = ttk.Button(dh, text="Open in ARIN Search", style="Small.TButton", command=self.open_web)
+        self.web_btn = ttk.Button(dh, text="Open in bgp.he.net", style="Small.TButton", command=self.open_web)
         self.web_btn.pack(side="right", padx=4)
         self.rir_btn = ttk.Button(dh, text="Open other registry", style="Small.TButton", command=self.open_rir)
         self.detail = scrolled_text(self, app, height=16)
         self.detail.container.pack(fill="both", expand=True, pady=(4, 0))
         self.detail.configure(state="disabled")
-        foot = ttk.Frame(self)
-        foot.pack(fill="x", pady=(4, 0))
-        ttk.Label(foot, text="Data from ARIN Whois-RWS (whois.arin.net). Use is subject to ARIN's ",
-                  style="Hint.TLabel").pack(side="left")
-        link(foot, "Whois Terms of Use", lambda: __import__("webbrowser").open(arinwhois.TOU_URL)).pack(side="left")
+        web = __import__("webbrowser")
+        self.foot_cymru = ttk.Frame(self)
+        # every label boundary falls on a word gap (ttk labels keep a few pixels of border around them)
+        for text_, url in (("IP and ASN data from", None), ("Team Cymru", cymru.WEBSITE), ("via its", None),
+                           ("IP to ASN mapping service", cymru.INFO_URL),
+                           ("(whois.cymru.com). Domains via RDAP / WHOIS.", None)):
+            if url:
+                w = link(self.foot_cymru, text_, lambda u=url: web.open(u), style="HintLink.TLabel")
+            else:
+                w = ttk.Label(self.foot_cymru, text=text_, style="Hint.TLabel")
+            w.pack(side="left", padx=(0, 1))
+        self.foot_arin = ttk.Frame(self)
+        for text_, url in (("Data from ARIN Whois-RWS (whois.arin.net) and the other registries' RDAP. Use is "
+                            "subject to ARIN's", None), ("Whois Terms of Use", arinwhois.TOU_URL)):
+            if url:
+                w = link(self.foot_arin, text_, lambda u=url: web.open(u), style="HintLink.TLabel")
+            else:
+                w = ttk.Label(self.foot_arin, text=text_, style="Hint.TLabel")
+            w.pack(side="left", padx=(0, 1))
+        self.mode = None
+        self.source_changed()
 
         self.debounce = Debouncer(self, 250, self.highlight)
         self.src.bind("<<Modified>>", self._modified)
@@ -3584,6 +3859,48 @@ class WhoisTab(ttk.Frame):
             except Exception:
                 pass
         threading.Thread(target=load_tlds, daemon=True).start()
+
+    def via_key(self) -> str:
+        return {v: k for k, v in self.VIA}.get(self.via_v.get(), "auto")
+
+    def source_key(self) -> str:
+        v = self.source_v.get()
+        return v if v in self.SOURCES else "cymru"
+
+    def source_changed(self):
+        """Show the options and footer for the chosen source (the table follows on the next Look up)."""
+        cymru_mode = self.source_key() == "cymru"
+        self.via_box.configure(state="readonly" if cymru_mode else "disabled")
+        self.contacts_cb.configure(text="Registrar contacts for domains" if cymru_mode else "Include contacts")
+        if cymru_mode:
+            self.rdap_cb.pack_forget()
+        elif not self.rdap_cb.winfo_ismapped():
+            self.rdap_cb.pack(side="left", after=self.contacts_cb)
+        show, hide = (self.foot_cymru, self.foot_arin) if cymru_mode else (self.foot_arin, self.foot_cymru)
+        hide.pack_forget()
+        show.pack(fill="x", pady=(4, 0))
+        if not self.results:
+            self.set_columns(self.source_key())
+
+    def columns_for(self, mode):
+        if mode == "arin":
+            return self.ARIN_COLUMNS, (115, 115, 110, 160, 62, 120, 170, 120)
+        return self.COLUMNS, (115, 130, 90, 220, 62, 120, 90, 160)
+
+    def set_columns(self, mode):
+        """Switch the table between the Team Cymru and ARIN column sets."""
+        if mode == self.mode:
+            return
+        self.mode = mode
+        cols, widths = self.columns_for(mode)
+        self.col_widths = widths
+        self.tree.delete(*self.tree.get_children())
+        self.tree.configure(columns=cols, displaycolumns=cols)
+        for col, w in zip(cols, widths):
+            self.tree.heading(col, text=col)
+            self.tree.column(col, width=w, minwidth=w, stretch=True, anchor="w")
+        self.tree.column("Country", stretch=False, anchor="center")
+        make_sortable(self.tree)
 
     # ---- source box
 
@@ -3651,12 +3968,15 @@ class WhoisTab(ttk.Frame):
             return "break"
         truncated = len(queries) > self.MAX_LOOKUPS
         queries = queries[:self.MAX_LOOKUPS]
+        mode = self.source_key()
+        self.set_columns(mode)
         self.tree.delete(*self.tree.get_children())
-        for col, w in zip(self.COLUMNS, self.col_widths):     # back to the default widths for a new search
+        for col, w in zip(self.columns_for(mode)[0], self.col_widths):   # default widths for a new search
             self.tree.column(col, width=w, minwidth=w)
         self.results = {}
         self.set_detail("")
         contacts, skip, follow = self.contacts_v.get(), self.skip_v.get(), self.rdap_v.get()
+        via = self.via_key()
         self.paths = arinwhois.extract_as_paths(self.get_text()) if self.do_asns_v.get() and self.bare_v.get() else []
         self.show_paths()
         import queue
@@ -3665,38 +3985,70 @@ class WhoisTab(ttk.Frame):
         self.stop_event = threading.Event()
         q, stop, base, cache = self.queue, self.stop_event, self.base, self.cache
 
+        def is_cymru(query):
+            try:
+                cymru.query_key(query)
+                return True
+            except cymru.CymruError:
+                return False
+
         def work():
+            local = {}
+            for query in queries:
+                if not domainwhois.is_domain(query):
+                    note = arinwhois.local_note(query)
+                    if note and skip:
+                        local[query] = note
+            asks = [x for x in queries if x not in local and not domainwhois.is_domain(x) and is_cymru(x)]
+            if mode == "arin":
+                asks = []                                     # ARIN / RDAP, one at a time below
             done_nets = []
+            recs = {}
+            if asks:
+                q.put(("status", f"Asking Team Cymru about {len(asks)} item(s) …"))
+                recs, note = cymru.lookup_many(
+                    asks, via=via, host=self.cymru_host, port=self.cymru_port, dns_server=self.cymru_dns,
+                    progress=lambda i, n: q.put(("status", f"Team Cymru over DNS: {i} of {n} …")),
+                    stop=stop.is_set)
+                if note:
+                    q.put(("note", note))
             for i, query in enumerate(queries, 1):
                 if stop.is_set():
                     break
-                if domainwhois.is_domain(query):
+                if query in local:
+                    r = arinwhois.WhoisResult(query=query, kind="local", note=local[query])
+                elif domainwhois.is_domain(query):
                     info = domainwhois.lookup_domain(query, timeout=15, follow_registrar=contacts,
                                                      cache_dir=self.domain_cache_dir, bootstrap_url=self.bootstrap_url,
                                                      iana=self.iana_whois, whois_port=self.whois_port)
                     r = arinwhois.WhoisResult(query=query, kind="domain", domain=info,
                                               error="" if info.not_registered else info.error)
-                    q.put(("result", (i, r)))
-                    continue
-                note = arinwhois.local_note(query)
-                if note and skip:
-                    r = arinwhois.WhoisResult(query=query, kind="local", note=note)
-                    q.put(("result", (i, r)))
-                    continue
-                # reuse an earlier answer for addresses in the same network – but not for other registries,
-                # where ARIN only returns the whole regional block (e.g. a RIPE /8)
-                reuse = next((d for d in done_nets if d.net and not d.other_rir and "/" not in query
-                              and d.net.contains(query)), None)
-                if reuse:
-                    import copy
-                    r = copy.copy(reuse)
-                    r.query = query
-                    r.note = (f"Same network as {reuse.query}. " + (reuse.note or "")).strip()
-                else:
-                    r = arinwhois.lookup(query, contacts=contacts, base=base, cache=cache, follow_rdap=follow,
+                elif query in recs:
+                    rec = recs[query]
+                    kind = "asn" if rec.kind == "asn" else ("cidr" if "/" in query else "ip")
+                    r = arinwhois.WhoisResult(query=query, kind=kind, error=rec.error, note=rec.note,
+                                              raw={"cymru": rec})
+                elif mode == "cymru" and is_cymru(query):
+                    continue                                  # stopped before Team Cymru answered
+                elif mode == "arin":
+                    # reuse an earlier answer for addresses in the same network – but not for other registries,
+                    # where ARIN only returns the whole regional block (e.g. a RIPE /8)
+                    reuse = next((d for d in done_nets if d.net and not d.other_rir and "/" not in query
+                                  and d.net.contains(query)), None)
+                    if reuse:
+                        import copy
+                        r = copy.copy(reuse)
+                        r.query = query
+                        r.note = (f"Same network as {reuse.query}. " + (reuse.note or "")).strip()
+                    else:
+                        r = arinwhois.lookup(query, contacts=contacts, base=base, cache=cache, follow_rdap=follow,
+                                             rdap_base=self.rdap_base)
+                        if r.net:
+                            done_nets.append(r)
+                else:                                         # an ARIN handle such as NET-8-8-8-0-2 or GOGL
+                    r = arinwhois.lookup(query, contacts=contacts, base=base, cache=cache, follow_rdap=True,
                                          rdap_base=self.rdap_base)
-                    if r.net:
-                        done_nets.append(r)
+                    r.note = ("ARIN handle (Team Cymru only maps IPs and ASNs). " + (r.note or "")).strip()
                 q.put(("result", (i, r)))
             q.put(("done", None))
 
@@ -3706,7 +4058,9 @@ class WhoisTab(ttk.Frame):
         self.truncated = truncated
         self.go_btn.configure(state="disabled")
         self.stop_btn.configure(state="normal")
-        self.status_lbl.configure(text=f"Looking up {self.total} item(s) at ARIN …")
+        self.via_note = ""
+        self.status_lbl.configure(text=f"Looking up {self.total} item(s)" + (" at ARIN" if mode == "arin" else "")
+                                  + " …")
         self.after(100, self.poll)
         return "break"
 
@@ -3728,6 +4082,10 @@ class WhoisTab(ttk.Frame):
                 if r.kind in ("asn", "local") and self.paths:
                     self.show_paths()
                 self.status_lbl.configure(text=f"Looked up {i} of {self.total} …")
+            elif kind == "status":
+                self.status_lbl.configure(text=data)
+            elif kind == "note":
+                self.via_note = data
             else:
                 finished = True
         if finished:
@@ -3738,6 +4096,8 @@ class WhoisTab(ttk.Frame):
             msg = f"Done – {len(self.results)} result(s)" + (f", {errors} error(s)" if errors else "")
             if self.truncated:
                 msg += f" (only the first {self.MAX_LOOKUPS} were looked up)"
+            if self.via_note:
+                msg += f" · {self.via_note}"
             if arinwhois.ssl_fallback_used():
                 msg += (" · certificate checks skipped: couldn't verify the servers with this computer's "
                         f"certificates ({arinwhois.trust_source()})")
@@ -3751,6 +4111,14 @@ class WhoisTab(ttk.Frame):
     def add_result(self, i, r):
         iid = f"r{i}"
         self.results[iid] = r
+        rec = r.raw.get("cymru") if r.raw else None
+        if rec is not None:
+            values, tag = self.cymru_row(r, rec)
+            self.tree.insert("", "end", iid=iid, values=values, tags=tag)
+            if self._autosize_job:
+                self.after_cancel(self._autosize_job)
+            self._autosize_job = self.after(150, lambda: autosize_columns(self.tree, self.app.mono, max_px=520))
+            return
         org = r.owner
         country = r.country
         if r.error:
@@ -3766,8 +4134,14 @@ class WhoisTab(ttk.Frame):
             notes = f"Expires {d.expires}" + (f" ({days} days)" if days is not None else "") if d.expires else ""
             if d.note and "host name" in d.note:
                 notes = (notes + " · registered domain " + d.domain).strip(" ·")
-            values = (r.query, d.domain, d.registrar, d.registrant_org or "(not published)", d.registrant_country,
-                      "Domain ." + d.domain.rsplit(".", 1)[-1], d.abuse_email, notes)
+            if self.mode == "arin":
+                values = (r.query, d.domain, d.registrar, d.registrant_org or "(not published)",
+                          d.registrant_country, "Domain ." + d.domain.rsplit(".", 1)[-1], d.abuse_email, notes)
+            else:
+                if d.registrar:
+                    notes = (f"Registrar {d.registrar} · " + notes).strip(" ·")
+                values = (r.query, d.domain, "", d.registrant_org or "(not published)", d.registrant_country,
+                          "Domain ." + d.domain.rsplit(".", 1)[-1], (d.created or "")[:10], notes)
             tag = ("rir",) if days is not None and days < 30 else ()
         elif r.kind == "local":
             values = (r.query, "", "", "", "", r.note, "", "Not looked up (local / special-use address)")
@@ -3788,12 +4162,31 @@ class WhoisTab(ttk.Frame):
                 notes = f"Registered with {rir}" + (" – " + r.note if r.note else "")
             else:
                 notes = r.note
-            values = (r.query, network, name, org, country, typ, ", ".join(r.abuse_emails), notes)
+            if self.mode == "arin":
+                values = (r.query, network, name, org, country, typ, ", ".join(r.abuse_emails), notes)
+            else:
+                notes = " · ".join(x for x in (name, ", ".join(r.abuse_emails), notes) if x)
+                values = (r.query, network, "", org, country, typ, "", notes)
             tag = ("rir",) if r.other_rir else ()
         self.tree.insert("", "end", iid=iid, values=values, tags=tag)
         if self._autosize_job:                       # widen columns to fit (table scrolls sideways if needed)
             self.after_cancel(self._autosize_job)
         self._autosize_job = self.after(150, lambda: autosize_columns(self.tree, self.app.mono, max_px=520))
+
+    def cymru_row(self, r, rec):
+        """Table values for a Team Cymru answer."""
+        if rec.error:
+            return (r.query, "", "", "", "", "ASN" if rec.kind == "asn" else "", "", rec.error), ("error",)
+        reg = rec.registry_name
+        if rec.kind == "asn":
+            typ = "ASN" + (f" · {reg}" if reg else "")
+            return (r.query, "", f"AS{rec.asn}", rec.as_name, rec.cc, typ, rec.allocated, rec.note), ()
+        typ = ("Prefix" if "/" in r.query else "IP") + (f" · {reg}" if reg else "")
+        tag = () if rec.announced else ("local",)
+        if len(rec.asns) > 1:
+            tag = ("rir",)
+        return (r.query, rec.prefix, rec.origin or "not announced", rec.as_name, rec.cc, typ, rec.allocated,
+                rec.note), tag
 
     # ---- details
 
@@ -3811,13 +4204,17 @@ class WhoisTab(ttk.Frame):
         r = self.selected()
         if not r:
             return
-        self.web_btn.configure(text="Open in ICANN Lookup" if r.kind == "domain" else "Open in ARIN Search")
-        if r.kind == "domain":
+        rec = r.raw.get("cymru") if r.raw else None
+        self.web_btn.configure(text="Open in ICANN Lookup" if r.kind == "domain" else
+                               "Open in bgp.he.net" if rec is not None else "Open in ARIN Search")
+        if rec is not None:
+            self.set_detail(cymru.format_record(rec))
+        elif r.kind == "domain":
             self.set_detail(domainwhois.format_domain(r.domain))
         elif r.kind == "local":
             self.set_detail(f"# {r.query}: {r.note}\n# Private, CGNAT and other special-use addresses aren't "
                             "registered to anyone, so they were skipped.\n# Untick 'Skip private …' to send them "
-                            "to ARIN anyway (it returns the IANA reservation).")
+                            "to Team Cymru anyway.")
         else:
             self.set_detail(arinwhois.format_result(r))
         if r.other_rir:
@@ -3831,9 +4228,12 @@ class WhoisTab(ttk.Frame):
         if r:
             import urllib.parse
             import webbrowser
+            rec = r.raw.get("cymru") if r.raw else None
             if r.kind == "domain":
                 name = r.domain.domain or r.query
                 webbrowser.open("https://lookup.icann.org/en/lookup?name=" + urllib.parse.quote(name))
+            elif rec is not None:
+                webbrowser.open(he_url(r.query, rec))
             else:
                 webbrowser.open(arinwhois.WEB_URL.format(query=urllib.parse.quote(r.query)))
 
@@ -3851,6 +4251,17 @@ class WhoisTab(ttk.Frame):
         r = self.results[row]
         menu = tk.Menu(self, tearoff=False)
         menu.add_command(label=f"Copy {r.query}", command=lambda: self.app.copy(r.query))
+        rec = r.raw.get("cymru") if r.raw else None
+        if rec is not None and not rec.error:
+            if rec.origin:
+                menu.add_command(label=f"Copy origin {rec.origin}", command=lambda: self.app.copy(rec.origin))
+            if rec.as_name:
+                menu.add_command(label="Copy AS name", command=lambda: self.app.copy(rec.as_name))
+            if rec.prefix:
+                menu.add_command(label=f"Open {rec.prefix} in IP Calc",
+                                 command=lambda: self.app.open_in_calculator(rec.prefix))
+            menu.add_command(label="Open in bgp.he.net",
+                             command=lambda: __import__("webbrowser").open(he_url(r.query, rec)))
         if r.abuse_emails:
             menu.add_command(label=f"Copy abuse email {r.abuse_emails[0]}",
                              command=lambda: self.app.copy(", ".join(r.abuse_emails)))
@@ -3874,6 +4285,9 @@ class WhoisTab(ttk.Frame):
                     return r.note
                 if r.error:
                     return "?"
+                rec = r.raw.get("cymru") if r.raw else None
+                if rec is not None:
+                    return rec.as_name or "?"
                 return r.owner or r.name
         return "…"
 
@@ -4053,6 +4467,7 @@ class CompareTab(ttk.Frame):
         self.side_frame.rowconfigure(0, weight=1)
         self.side_frame.columnconfigure(0, weight=1, uniform="side")
         self.side_frame.columnconfigure(2, weight=1, uniform="side")
+        self.after_idle(lambda: BoxSizer(app, self.side_frame, self.side, key="CompareTab.side"))
 
         # unified diff
         self.uni_frame = ttk.Frame(self.views)
@@ -6589,6 +7004,393 @@ class BandwidthCostTab(ttk.Frame):
         return dict(bw_form=self.form())
 
 
+# --------------------------------------------------------------------------- PeeringDB tab
+
+
+class PeeringDBTab(ttk.Frame):
+    """Networks, exchanges, facilities and organizations from PeeringDB, laid out like peeringdb.com."""
+
+    MAX_TEXT_LINES = 34
+
+    def __init__(self, master, app: "App"):
+        super().__init__(master, padding=12)
+        self.app = app
+        s = app.settings
+        self.api_url = s.get("peeringdb_api_url", peeringdb.API_URL)          # override only for testing
+        self.client = None
+        self.record = None
+        self.history = []                    # (kind, value) of earlier records, for Back
+        self.current = None
+        self.worker = None
+        self.links = {}
+        self.table_widgets = []
+
+        head = ttk.Frame(self)
+        head.pack(fill="x")
+        ttk.Label(head, text="PeeringDB", style="Title.TLabel").pack(side="left")
+        ttk.Label(head, text="  ASN, network / exchange / facility name, exchange peering IP, or a peeringdb.com link",
+                  style="Hint.TLabel").pack(side="left")
+        row = ttk.Frame(self)
+        row.pack(fill="x", pady=(6, 0))
+        self.back_btn = ttk.Button(row, text="◀ Back", command=self.back, state="disabled", width=7)
+        self.back_btn.pack(side="left")
+        self.query_v = tk.StringVar(value=s.get("peeringdb_query", "AS10279"))
+        self.entry = ttk.Entry(row, textvariable=self.query_v, width=44, font=app.mono)
+        self.entry.pack(side="left", padx=6)
+        self.entry.bind("<Return>", lambda e: self.start())
+        self.entry.bind("<KP_Enter>", lambda e: self.start())
+        self.go_btn = ttk.Button(row, text="Look up", style="Accent.TButton", command=self.start)
+        self.go_btn.pack(side="left")
+        link(row, "Get one", lambda: __import__("webbrowser").open(peeringdb.APIKEY_URL),
+             style="HintLink.TLabel").pack(side="right")
+        self.key_v = tk.StringVar(value=s.get("peeringdb_api_key", ""))
+        ttk.Entry(row, textvariable=self.key_v, width=26, show="•").pack(side="right", padx=(4, 6))
+        ttk.Label(row, text="API key (optional):").pack(side="right")
+
+        ttk.Separator(self).pack(fill="x", pady=10)
+        self.status_lbl = ttk.Label(self, style="Hint.TLabel",
+                                    text="Enter an ASN (e.g. 10279), a name, an exchange IP, or a PeeringDB link, "
+                                         "and press Look up.")
+        self.status_lbl.pack(anchor="w")
+
+        self.result = ttk.Frame(self)
+        th = ttk.Frame(self.result)
+        th.pack(fill="x", pady=(4, 0))
+        self.title_lbl = ttk.Label(th, style="Big.TLabel")
+        self.title_lbl.pack(side="left")
+        self.sub_lbl = ttk.Label(th, style="Hint.TLabel")
+        self.sub_lbl.pack(side="left", padx=(10, 0), pady=(6, 0))
+        ttk.Button(th, text="Copy all", style="Small.TButton", command=self.copy_all).pack(side="right")
+        self.site_link = link(th, "View on PeeringDB ↗", self.open_site, style="FieldLink.TLabel")
+        self.site_link.pack(side="right", padx=10)
+        self.note_lbl = ttk.Label(self.result, style="Field.TLabel", wraplength=900, justify="left")
+        cols = ttk.Frame(self.result)
+        cols.pack(fill="x", pady=(8, 0))
+        cols.columnconfigure(0, weight=3, uniform="pdb")
+        cols.columnconfigure(1, weight=2, uniform="pdb")
+        self.main_text = scrolled_text(cols, app, height=12, width=30, wrap="word")   # grows with the window
+        self.main_text.container.grid(row=0, column=0, sticky="nsew", padx=(0, 6))
+        self.side_text = scrolled_text(cols, app, height=12, width=30, wrap="word")   # grows with the window
+        self.side_text.container.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        for t in (self.main_text, self.side_text):
+            t.configure(state="disabled", cursor="arrow")
+            self._text_tags(t)
+        self.tables_frame = ttk.Frame(self.result)
+        self.tables_frame.pack(fill="both", expand=True)
+        ttk.Label(self, text="Data from PeeringDB (peeringdb.com), the freely available interconnection database. "
+                             "Double-click a row to open it here; right-click for more.",
+                  style="Hint.TLabel").pack(side="bottom", anchor="w", pady=(8, 0))
+
+    # ---- text panes
+
+    def _text_tags(self, t):
+        c = self.app.colors
+        bold = tkfont.Font(font=self.app.mono)
+        bold.configure(weight="bold")
+        self._bold = bold
+        t.tag_configure("h", font=bold, spacing1=6, spacing3=4)
+        t.tag_configure("lbl", foreground=c["muted"])
+        t.tag_configure("note", foreground=c["muted"])
+        t.tag_configure("link", foreground=c["link"], underline=True)
+        t.tag_bind("link", "<Enter>", lambda e, w=t: w.configure(cursor="hand2"))
+        t.tag_bind("link", "<Leave>", lambda e, w=t: w.configure(cursor="arrow"))
+
+    def _add_link(self, t, start, end, target):
+        tag = f"L{len(self.links)}"
+        self.links[tag] = target
+        t.tag_add("link", start, end)
+        t.tag_add(tag, start, end)
+        t.tag_bind(tag, "<Button-1>", lambda e, x=target: self.follow(x))
+
+    def _render_sections(self, t, sections):
+        t.configure(state="normal")
+        t.delete("1.0", "end")
+        cw = self.app.mono.measure("0")
+        for n, sec in enumerate(sections):
+            if sec.title:
+                t.insert("end", ("\n" if n else "") + sec.title + "\n", "h")
+            w = max((len(f.label) for f in sec.fields), default=0)
+            margin = f"m{w}"
+            t.tag_configure(margin, lmargin2=(w + 2) * cw)
+            for f in sec.fields:
+                lines = f.value.splitlines() or [""]
+                t.insert("end", f"{f.label:<{w}}  ", ("lbl", margin))
+                for i, line in enumerate(lines):
+                    if i:
+                        t.insert("end", " " * (w + 2), margin)
+                    start = t.index("end-1c")
+                    t.insert("end", line, margin)
+                    if f.link and line:
+                        self._add_link(t, start, t.index("end-1c"), f.link)
+                    t.insert("end", "\n", margin)
+            if sec.table:
+                cols, rows = sec.table
+                if rows:
+                    start_line = int(t.index("end-1c").split(".")[0])
+                    t.insert("end", texttable.format_table(cols, rows) + "\n")
+                    self._link_contacts(t, f"{start_line}.0", "end")
+                    t.tag_add("lbl", f"{start_line}.0", f"{start_line}.end")
+            if sec.note:
+                t.insert("end", sec.note + "\n", "note")
+        t.delete("end-2c", "end-1c") if t.get("end-2c", "end-1c") == "\n" else None
+        t.configure(state="disabled")
+
+    def _link_contacts(self, t, start, end):
+        text = t.get(start, end)
+        for m in re.finditer(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+|https?://\S+", text):
+            a = f"{start}+{m.start()}c"
+            self._add_link(t, a, f"{start}+{m.end()}c",
+                           m.group(0) if m.group(0).startswith("http") else "mailto:" + m.group(0))
+
+    def _lines(self, t) -> int:
+        """Content height in text lines, counting wrapped lines and the headings' extra spacing."""
+        t.update_idletasks()
+        try:
+            px = int(t.count("1.0", "end", "ypixels")[0])
+            return -(-px // max(1, self.app.mono.metrics("linespace"))) + 1
+        except (tk.TclError, TypeError, IndexError):
+            return int(t.index("end-1c").split(".")[0]) + 2
+
+    def _fit_panes(self):
+        """Both panes share a row: size them to the longer one's content (unless sized with a grip)."""
+        panes = [self.main_text] + ([self.side_text] if self.side_text.container.winfo_manager() else [])
+        n = max(3, min(self.MAX_TEXT_LINES, max(self._lines(t) for t in panes)))
+        for t in panes:
+            sizer = getattr(t, "sizer", None)
+            if not (sizer is not None and sizer.user_sized) and int(t.cget("height")) != n:
+                t.configure(height=n)
+
+    # ---- tables
+
+    def _build_tables(self, tables):
+        for w in self.table_widgets:
+            w.destroy()
+        self.table_widgets = []
+        for tbl in tables:
+            box = ttk.Frame(self.tables_frame)
+            box.pack(fill="x", pady=(14, 0))
+            self.table_widgets.append(box)
+            h = ttk.Frame(box)
+            h.pack(fill="x")
+            ttk.Label(h, text=tbl.title, style="Title.TLabel").pack(side="left")
+            ttk.Label(h, text=f"  {len(tbl.rows):,}", style="Hint.TLabel").pack(side="left", pady=(4, 0))
+            if tbl.note:
+                ttk.Label(h, text="   " + tbl.note, style="Hint.TLabel").pack(side="left", pady=(4, 0))
+            widths = tbl.widths or [150] * len(tbl.columns)
+            tree = make_tree(box, tbl.columns, widths, sizer=False)
+            tree.configure(height=max(2, min(14, len(tbl.rows))), selectmode="extended")
+            tree.container.pack(fill="x", pady=(4, 0))
+            BoxSizer(self.app, tree.container, [tree])
+            ttk.Button(h, text="Copy", style="Small.TButton",
+                       command=lambda t=tree: self.app.copy(texttable.tree_table(t))).pack(side="right")
+            if not tbl.rows:
+                ttk.Label(box, text="None listed.", style="Hint.TLabel").pack(anchor="w")
+            targets = {}
+            for i, row in enumerate(tbl.rows):
+                iid = tree.insert("", "end", values=row)
+                targets[iid] = tbl.targets[i] if i < len(tbl.targets) else ""
+                if i == tbl.highlight:
+                    tree.selection_set(iid)
+                    tree.see(iid)
+            tree.targets = targets
+            tree.spec = tbl
+            make_sortable(tree, numeric=tbl.numeric)
+            tree.bind("<Double-1>", lambda e, t=tree: self._open_row(t, e))
+            tree.bind("<Return>", lambda e, t=tree: self._open_row(t, None))
+            tree.bind(self.app.right_click, lambda e, t=tree: self._row_menu(t, e))
+            autosize_columns(tree, self.app.mono, max_px=360)
+
+    def _open_row(self, tree, e):
+        iid = tree.identify_row(e.y) if e is not None else (tree.focus() or "")
+        target = tree.targets.get(iid, "")
+        if target:
+            self.follow(target)
+        return "break"
+
+    def _row_menu(self, tree, e):
+        iid = tree.identify_row(e.y)
+        if not iid:
+            return
+        if iid not in tree.selection():
+            tree.selection_set(iid)
+        values = dict(zip(tree["columns"], tree.item(iid, "values")))
+        target = tree.targets.get(iid, "")
+        name = str(next(iter(values.values()), ""))
+        menu = tk.Menu(self, tearoff=False)
+        if target:
+            kind, oid = target[4:].split("/", 1)
+            menu.add_command(label=f"Open {sendto.preview(name, 40)} here", command=lambda: self.follow(target))
+            menu.add_command(label="Open on peeringdb.com",
+                             command=lambda: __import__("webbrowser").open(peeringdb.site_url(kind, oid)))
+            menu.add_separator()
+        asn = str(values.get("ASN", "")).strip()
+        if asn.isdigit():
+            menu.add_command(label=f"Whois AS{asn}", command=lambda: self.app.send_to("whois", f"AS{asn}"))
+            menu.add_command(label=f"IRR / RPKI for AS{asn}", command=lambda: self.app.send_to("irr", f"AS{asn}"))
+        for col in ("IPv4", "IPv6"):
+            ip = str(values.get(col, "")).strip()
+            if ip:
+                menu.add_command(label=f"Ping {ip}", command=lambda x=ip: self.app.send_to("ping", x))
+                menu.add_command(label=f"Copy {ip}", command=lambda x=ip: self.app.copy(x))
+        prefix = str(values.get("Prefix", "")).strip()
+        if prefix:
+            menu.add_command(label=f"Open {prefix} in IP Calc", command=lambda: self.app.open_in_calculator(prefix))
+        rows = texttable.tree_table(tree, tree.selection())
+        menu.add_command(label="Copy row" if len(tree.selection()) == 1 else f"Copy {len(tree.selection())} rows",
+                         command=lambda: self.app.copy(rows))
+        self.app.popup_tree_menu(menu, e)
+        return "break"
+
+    # ---- running a lookup
+
+    def follow(self, target: str):
+        """A link in the results: pdb:kind/id opens here; anything else opens in the browser / mail app."""
+        if target.startswith("pdb:"):
+            kind, oid = target[4:].split("/", 1)
+            if oid.isdigit():
+                self.query_v.set(peeringdb.site_url(kind, oid))
+                self.run(kind, int(oid))
+            return
+        import webbrowser
+        webbrowser.open(target)
+
+    def start(self):
+        kind, value = peeringdb.classify(self.query_v.get())
+        if not kind:
+            self.status_lbl.configure(text="Enter an ASN, a name, an exchange IP address, or a PeeringDB link.")
+            return "break"
+        self.run(kind, value)
+        return "break"
+
+    def get_client(self):
+        key = self.key_v.get().strip()
+        if self.client is None or self.client.api_key != key:
+            self.client = peeringdb.Client(api_key=key, base=self.api_url)
+        return self.client
+
+    def run(self, kind, value, remember=True):
+        if self.worker:
+            return
+        if remember and self.current and self.current != (kind, value):
+            self.history.append(self.current)
+        self.pending = (kind, value)
+        import queue
+        import threading
+        self.queue = queue.Queue()
+        client, q = self.get_client(), self.queue
+
+        def work():
+            try:
+                q.put(("done", peeringdb.load(client, kind, value, progress=lambda m: q.put(("status", m)))))
+            except peeringdb.PdbError as exc:
+                q.put(("error", exc))
+            except Exception as exc:                      # never leave the tab stuck
+                q.put(("error", peeringdb.PdbError(f"Lookup failed: {exc}")))
+
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+        self.go_btn.configure(state="disabled")
+        self.status_lbl.configure(text="Asking PeeringDB …", style="Hint.TLabel")
+        self.after(80, self.poll)
+
+    def poll(self):
+        import queue as _q
+        while True:
+            try:
+                kind, data = self.queue.get_nowait()
+            except _q.Empty:
+                self.after(80, self.poll)
+                return
+            if kind == "status":
+                self.status_lbl.configure(text=data)
+                continue
+            self.worker = None
+            self.go_btn.configure(state="normal")
+            if kind == "error":
+                if self.history and self.history[-1] == self.current:
+                    self.history.pop()                  # nothing new was shown: Back stays where it was
+                self.status_lbl.configure(text=str(data), style="Error.TLabel")
+            else:
+                self.current = self.pending
+                self.show_record(data)
+            self.back_btn.configure(state="normal" if self.history else "disabled")
+            return
+
+    def back(self):
+        if self.history and not self.worker:
+            kind, value = self.history.pop()
+            self.query_v.set(peeringdb.site_url(kind, value) if kind in peeringdb.KINDS else
+                             (f"AS{value}" if kind == "asn" else str(value)))
+            self.current = None
+            self.run(kind, value, remember=False)
+
+    def show_record(self, rec):
+        self.record = rec
+        self.links = {}
+        if not self.result.winfo_ismapped():
+            self.result.pack(fill="both", expand=True)
+        self.title_lbl.configure(text=rec.title)
+        self.sub_lbl.configure(text=rec.subtitle)
+        self.site_link.configure(text="View on PeeringDB ↗" if rec.kind != "search" else "Search on PeeringDB ↗")
+        if rec.note:
+            self.note_lbl.configure(text=rec.note)
+            self.note_lbl.pack(anchor="w", pady=(6, 0), after=self.title_lbl.master)
+        else:
+            self.note_lbl.pack_forget()
+        cols = self.main_text.container.master
+        if rec.main or rec.side:
+            cols.pack(fill="x", pady=(8, 0), before=self.tables_frame)
+            self._render_sections(self.main_text, rec.main)
+            self._render_sections(self.side_text, rec.side)
+            if rec.side:
+                self.side_text.container.grid()
+            else:
+                self.side_text.container.grid_remove()
+            self._fit_panes()
+            self.after(250, self._fit_panes)       # once the panes have their final width, wrapping may add lines
+        else:
+            cols.pack_forget()
+        self._build_tables(rec.tables)
+        calls = self.client.calls if self.client else 0
+        what = {"search": "Search results", "net": "Network", "ix": "Exchange", "fac": "Facility",
+                "org": "Organization"}.get(rec.kind, "Record")
+        self.status_lbl.configure(text=f"{what} from PeeringDB · {calls} API quer{'y' if calls == 1 else 'ies'} "
+                                       "this session", style="Hint.TLabel")
+        if rec.kind == "search" and len(rec.tables[0].rows) == 1 and rec.tables[0].targets:
+            self.current = None                         # one match: open it straight away (Back skips the search)
+            self.follow(rec.tables[0].targets[0])
+
+    def open_site(self):
+        if self.record and self.record.url:
+            import webbrowser
+            webbrowser.open(self.record.url)
+
+    def copy_all(self):
+        if self.record:
+            self.app.copy(peeringdb.record_text(self.record))
+
+    def load(self, text: str) -> str:
+        """Send to: pick a PeeringDB link, ASN, or IP out of `text`, or use the first line as a name search."""
+        m = re.search(r"(?i)peeringdb\.com/(?:net|ix|fac|org)/\d+", text)
+        a = re.search(r"(?i)\bAS\s?(\d{1,10})\b", text)
+        ip = sendto.IPV4.search(text) or sendto._first_v6(text)
+        if m:
+            q = m.group(0)
+        elif a:
+            q = f"AS{a.group(1)}"
+        elif ip:
+            q = ip.group(0)
+        else:
+            q = sendto.first_line(text)
+        self.query_v.set(q)
+        self.start()
+        return q
+
+    def settings_dict(self):
+        return {"peeringdb_query": self.query_v.get(), "peeringdb_api_key": self.key_v.get().strip()}
+
+
+
 # --------------------------------------------------------------------------- home tab
 
 TOOL_INFO = {
@@ -6608,12 +7410,14 @@ TOOL_INFO = {
     "ping": "Ping many hosts at once with live loss and latency stats, a note per host, and a full ping history.",
     "sweep": "Ping every address in a list, range, or subnet and see at a glance which ones are alive.",
     "trace": "Traceroute to a host, with or without name lookups, filling in each hop as it answers.",
-    "whois": "Who owns an IP, prefix, ASN, BGP AS path, or domain name: ARIN, the other registries via RDAP, "
-             "and domain WHOIS.",
+    "whois": "Who announces an IP or prefix and who owns an ASN or BGP AS path (Team Cymru, or ARIN and the "
+             "other registries), plus domain-name WHOIS.",
     "routes": "Summarise 'show ip route' / 'show route' from IOS, XE, XR, NX-OS, Junos or EOS: routes by "
               "protocol, next hops, recent changes and unusually high metrics.",
     "irr": "Expand an ASN or AS-SET from the IRR (like bgpq4), check every route object against RPKI, and build "
            "prefix filters for IOS-XR, IOS-XE, NX-OS, Junos, Arista EOS, Nokia SR OS or SR Linux.",
+    "peeringdb": "Look up a network, exchange, facility or organization in PeeringDB by ASN, name, exchange IP or "
+                 "link: peering policy, contacts, exchange ports and facilities, laid out like the website.",
     "compare": "Compare two files or pasted text side by side, as a unified diff, or as the lines unique to each.",
     "logtime": "Find every date and time in a log and convert it to another time zone, right in place.",
 }
@@ -6760,6 +7564,7 @@ class App:
         self.whois_page = ScrollPage(nb)
         self.routes_page = ScrollPage(nb)
         self.irr_page = ScrollPage(nb)
+        self.pdb_page = ScrollPage(nb)
         self.bwcost_page = ScrollPage(nb)
         self.compare_page = ScrollPage(nb)
         self.logtime_page = ScrollPage(nb)
@@ -6778,6 +7583,7 @@ class App:
         self.whois = WhoisTab(self.whois_page.body, self)
         self.routes = RouteTableTab(self.routes_page.body, self)
         self.irr = IrrTab(self.irr_page.body, self)
+        self.pdb = PeeringDBTab(self.pdb_page.body, self)
         self.bwcost = BandwidthCostTab(self.bwcost_page.body, self)
         self.compare = CompareTab(self.compare_page.body, self)
         self.logtime = LogTimeTab(self.logtime_page.body, self)
@@ -6795,6 +7601,7 @@ class App:
         self.whois.pack(fill="both", expand=True)
         self.routes.pack(fill="both", expand=True)
         self.irr.pack(fill="both", expand=True)
+        self.pdb.pack(fill="both", expand=True)
         self.bwcost.pack(fill="both", expand=True)
         self.compare.pack(fill="both", expand=True)
         self.logtime.pack(fill="both", expand=True)
@@ -6817,6 +7624,7 @@ class App:
             ("whois", "Whois", "Network", self.whois_page),
             ("routes", "Route Table", "Network", self.routes_page),
             ("irr", "IRR / RPKI", "Network", self.irr_page),
+            ("peeringdb", "PeeringDB", "Network", self.pdb_page),
             ("compare", "Compare", "Text & logs", self.compare_page),
             ("logtime", "Log Times", "Text & logs", self.logtime_page),
         ]
@@ -7548,6 +8356,7 @@ class App:
         self._fonts = (title, small)
         style.configure("Title.TLabel", font=title)
         style.configure("Hint.TLabel", font=small)
+        style.configure("HintLink.TLabel", font=small)              # a link inside a hint line
         style.configure("ChromeHint.TLabel", font=small)
         style.configure("Badge.TLabel", font=small)
         style.configure("Warn.TLabel", font=small)
@@ -7572,6 +8381,7 @@ class App:
         self.apply_text_size(self.text_size, initial=True)
         style.configure("Big.TLabel", font=big)
         style.configure("Field.TLabel", font=field_font)
+        style.configure("FieldLink.TLabel", font=field_font)        # a link inside a field label
         style.configure("Accent.TButton", font=field_font)
         style.configure("Tools.TMenubutton", font=field_font, padding=(10, 3))
         style.configure("Cal.TButton", padding=(2, 1))
@@ -7606,7 +8416,8 @@ class App:
         st.configure("Chrome.TLabel", background=c["chrome"], foreground=c["fg"])
         st.configure("ChromeHint.TLabel", background=c["chrome"], foreground=c["chrome_muted"])
         for name, key in (("Hint.TLabel", "muted"), ("Key.TLabel", "muted"), ("Warn.TLabel", "warn"),
-                          ("Error.TLabel", "error"), ("Link.TLabel", "link")):
+                          ("Error.TLabel", "error"), ("Link.TLabel", "link"), ("FieldLink.TLabel", "link"),
+                          ("HintLink.TLabel", "link")):
             st.configure(name, background=c["page"], foreground=c[key])
         st.configure("Badge.TLabel", background=c["badge_bg"], foreground=c["badge_fg"])
         for name in ("TCheckbutton", "TRadiobutton"):
@@ -7660,6 +8471,9 @@ class App:
                      arrowcolor=c["fg"], lightcolor=c["button"], darkcolor=c["button"])
         st.map("TScrollbar", background=[("active", c["button_active"]), ("disabled", c["trough"])])
         st.configure("TSeparator", background=c["border"])
+        st.configure("Grip.TFrame", background=c["page"])          # box resize grips
+        st.configure("GripBar.TFrame", background=c["border"])
+        st.configure("GripBarHot.TFrame", background=c["accent"])
         st.configure("TProgressbar", background=c["accent"], troughcolor=c["trough"], bordercolor=c["border"],
                      lightcolor=c["accent"], darkcolor=c["accent"])
         st.configure("Sash", background=c["page"])
@@ -8064,6 +8878,8 @@ class App:
             if not m and not (num and unit in units):
                 return "Bandwidth Cost: no $ amount or Mbps/Gbps rate found in what you sent."
             b.refresh()
+        elif key == "peeringdb":
+            return f"PeeringDB: {self.pdb.load(text)}"
         elif key == "irr":
             found = self.irr.load(text)
             if not found:
@@ -8242,6 +9058,8 @@ class App:
             whois_contacts=self.whois.contacts_v.get(),
             whois_skip_private=self.whois.skip_v.get(),
             whois_rdap=self.whois.rdap_v.get(),
+            whois_via=self.whois.via_key(),
+            whois_source=self.whois.source_key(),
             whois_ips=self.whois.do_ips_v.get(),
             whois_asns=self.whois.do_asns_v.get(),
             whois_bare_asns=self.whois.bare_v.get(),
@@ -8257,6 +9075,7 @@ class App:
             **self.logtime.settings_dict(),
             **self.irr.settings_dict(),
             **self.bwcost.settings_dict(),
+            **self.pdb.settings_dict(),
         )
         if self.tz.available:
             self.settings.update(tz_source=self.tz.source_var.get(), tz_targets=self.tz.targets)
