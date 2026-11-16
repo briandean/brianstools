@@ -1,0 +1,8 @@
+# Python's compiled cache
+__pycache__/
+*.pyc
+
+# build.py output
+build/
+dist/
+*.spec
