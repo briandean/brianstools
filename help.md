@@ -45,7 +45,7 @@ Right-click any text box, input field, result value, or table cell in any tool.
   - **Ping** adds and starts every IP or host name. Lines that start with a target keep the rest of the line as the note (`192.0.2.1 Core router`).
   - **Ping Sweep** loads the list but waits for you to press **Start**.
   - **Compare** asks for the left or right side.
-- **Tables:** right-clicking a cell sends that cell. With several rows selected, it sends that column for all of them (for example, every IP in a sweep result). Tables with their own menu keep it and gain **Send to** at the bottom. Tables without one get Copy cell, Copy row, and Send to.
+- **Tables:** right-clicking a cell sends that cell. With several rows selected, it sends that column for all of them (for example, every IP in a sweep result). Tables with their own menu keep it and gain **Send to** at the bottom. Tables without one get Copy cell, Copy row, and Send to. **Ctrl+C** (⌘C on macOS) in any table copies the selected rows as an aligned text table.
 
 ### Copying tables
 
@@ -102,7 +102,7 @@ Everything the app remembers between launches is in `settings.json`. The downloa
 - **Show settings folder** opens the folder in Finder or Explorer.
 - **Reset all settings…** clears everything back to defaults after asking. Your oui.txt is kept.
 
-`settings.json` holds your favorites and their order, the last favorite you used, appearance, text size, window size, each tool's inputs and options, ping targets with their notes, and the oui.txt location. It's written when the app closes, so edit it by hand only while the app is closed. Deleting it resets everything to defaults.
+`settings.json` holds your favorites and their order, the last favorite you used, appearance, text size, window size (not its position), each tool's inputs and options, ping targets with their notes, and the oui.txt location. It's written when the app closes, so edit it by hand only while the app is closed. Deleting it resets everything to defaults.
 
 ## IP tools
 
@@ -440,6 +440,7 @@ Open a log file or paste text. Every date/time in it is found and rewritten in a
 | IP Calc: back to the previous block | ⌘[ | Ctrl+[ |
 | Run / compare / convert (multi-line boxes) | ⌘Return | Ctrl+Return |
 | Save in the settings editor | ⌘S | Ctrl+S |
+| Copy the selected table rows | ⌘C | Ctrl+C |
 | Context menu | right-click or Ctrl-click | right-click |
 
 ## Network use and privacy

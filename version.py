@@ -6,8 +6,8 @@ numbers, so the same string works as a macOS bundle version and a Windows file v
 APP_NAME = "Brian's Tools"
 BUILD_NAME = "Brian's Tools"                # app / .exe file name
 TAGLINE = "Network Toolbox"
-VERSION = "0.2026.1012.2"
-RELEASE_DATE = "2026-10-12"
+VERSION = "0.2026.1115"
+RELEASE_DATE = "2026-11-15"
 WEBSITE = "https://brianstools.net"
 WEBSITE_LABEL = "brianstools.net"
 USER_AGENT = f"BriansTools/{VERSION} (+{WEBSITE})"

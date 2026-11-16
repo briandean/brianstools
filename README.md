@@ -2,7 +2,7 @@
 
 *Vibed with Anthropic for Python*
 
-**Network Toolbox** · version 0.2026.1012.2 (October 12, 2026) · <https://brianstools.net>
+**Network Toolbox** · version 0.2026.1115 (November 15, 2026) · <https://brianstools.net>
 
 A desktop toolkit for network admins: subnet calculator and summarizer, bit/byte converter, time zone and date calculators, MAC address formatting and vendor lookup, a dig-style DNS client (Digr), ping, ping sweep, traceroute, whois (IP/ASN via [Team Cymru](https://www.team-cymru.com) or ARIN and the other registries, plus domain names), a route-table analyzer, a PeeringDB browser, a text/file compare, and a log timestamp time-zone converter. It runs on Windows, macOS, and Linux and uses only the Python standard library (`ipaddress`, `zoneinfo`, Tkinter). The one exception is Windows, which needs `pip install tzdata` for the time zone database.
 
@@ -48,7 +48,7 @@ Requires Python 3.9+ with Tk:
     - **Ping** adds and starts every IP or host name. Lines that start with a target keep the rest of the line as the note (`192.0.2.1 Core router`).
     - **Ping Sweep** loads the list but waits for you to press **Start**.
     - **Compare** asks for the left or right side.
-  - **Tables:** right-clicking a cell sends that cell. With several rows selected, it sends that column for all of them (for example, every IP in a sweep result). Tables with their own menu keep it and gain **Send to** at the bottom. Tables without one get Copy cell, Copy row, and Send to.
+  - **Tables:** right-clicking a cell sends that cell. With several rows selected, it sends that column for all of them (for example, every IP in a sweep result). Tables with their own menu keep it and gain **Send to** at the bottom. Tables without one get Copy cell, Copy row, and Send to. **Ctrl+C** (⌘C on macOS) in any table copies the selected rows as an aligned text table.
 
 - **IP Calc tab:** one input box that detects IPv4 vs IPv6.
   - IPv4 input: `10.1.2.3/24`, `10.1.2.3 255.255.255.0`, `10.1.2.3/255.255.255.0`, wildcard `10.1.2.3 0.0.0.255`, or a bare IP (/32).
@@ -311,7 +311,7 @@ Requires Python 3.9+ with Tk:
   - Both themes use the brand kit colours and look the same on every OS. The macOS title bar follows the choice too.
 - **Fonts and text size:** the app uses each platform's own interface font: SF Pro on macOS, Segoe UI on Windows, and the desktop font on Linux. Addresses, tables, and output use a clean monospace font (SF Mono or Menlo; Cascadia Mono or Consolas; DejaVu Sans Mono). **Tools → Text size** offers Small, Medium (the default, one step below the system size), Large (the system size), and Larger. The change applies right away and is remembered.
 - **Ctrl+L / ⌘L** jumps to the input box.
-- Your last input, split sizes, summarize text, converter settings, time zone list, and window size are saved between runs. Settings are kept in `%APPDATA%\BriansTools` (Windows), `~/Library/Application Support/BriansTools` (macOS), or `~/.config/brianstools` (Linux). Settings from the old Subnet Calculator name are carried over automatically the first time.
+- Your last input, split sizes, summarize text, converter settings, time zone list, and window size are saved between runs. The window's position isn't saved: it always opens on the primary screen. Settings are kept in `%APPDATA%\BriansTools` (Windows), `~/Library/Application Support/BriansTools` (macOS), or `~/.config/brianstools` (Linux). Settings from the old Subnet Calculator name are carried over automatically the first time.
 
 ## Version and help
 
@@ -322,6 +322,16 @@ Requires Python 3.9+ with Tk:
 **Opening help:** **☰ Tools → Brian's Tools Help** or **F1**; the **Help** link under the title on Home; the **Help** button in About; and on macOS, **Help → Brian's Tools Help** in the menu bar. The page opens in your web browser from a copy in the settings folder (`help/index.html`), so it keeps working after a one-file build's temporary folder is cleaned up.
 
 **About:** **☰ Tools → About Brian's Tools** (on macOS also **Brian's Tools → About Brian's Tools**) shows the version, release date, website link, and the Python/Tk/OS versions. **Copy version info** puts all of that on the clipboard for bug reports. **☰ Tools → Website** opens brianstools.net.
+
+## Changes
+
+### 0.2026.1115 (November 15, 2026)
+
+- **Window always opens on the primary screen.** The app used to reopen at its last position, which could be on a monitor that was no longer connected, leaving the window off-screen and unreachable. Only the window size is remembered now. Positions saved by older versions are ignored, so no settings need to be reset.
+- **Windows: copied text survives closing the app.** Text copied from the app (Copy buttons, the right-click menu, Ctrl+C, Ctrl+X) used to disappear from the clipboard if the app was closed before pasting. It now stays.
+- **Ctrl+C in tables.** Ctrl+C (⌘C on macOS) copies the selected rows of any table as an aligned text table. Before, tables could only be copied from the right-click menu or a Copy button.
+- **Linux: paste replaces the selection.** Pasting over selected text used to insert next to it. Ctrl+A now selects all, matching the right-click menu.
+- **Linux and macOS: Ctrl+C in read-only boxes.** Clicking an output box now gives it the keyboard focus, so Ctrl+C / ⌘C copies its selection on older Tk versions (8.6).
 
 ## Where settings are kept
 
@@ -337,7 +347,7 @@ Everything the app remembers between launches is in `settings.json`. The downloa
 - **Show settings folder** opens the folder in Finder or Explorer.
 - **Reset all settings…** clears everything back to defaults after asking. Your oui.txt is kept.
 
-`settings.json` holds your favorites and their order, the heights you've dragged boxes to, the last favorite you used, appearance, text size, window size, each tool's inputs and options, ping targets with their notes, and the oui.txt location. It's written when the app closes, so edit it by hand only while the app is closed. Deleting it resets everything to defaults.
+`settings.json` holds your favorites and their order, the heights you've dragged boxes to, the last favorite you used, appearance, text size, window size (not its position), each tool's inputs and options, ping targets with their notes, and the oui.txt location. It's written when the app closes, so edit it by hand only while the app is closed. Deleting it resets everything to defaults.
 
 ## Build a standalone app (optional)
 
