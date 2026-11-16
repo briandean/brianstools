@@ -91,6 +91,87 @@ def save_settings(data: dict) -> None:
         pass
 
 
+# --------------------------------------------------------------------------- Windows clipboard
+
+# Tk on Windows only *promises* copied text to the clipboard and hands it over when another program
+# asks. If nothing asked before the app closed, the clipboard is left empty, and a paste made while
+# the app is busy also comes up empty. Putting the text on the clipboard directly avoids both.
+
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+
+
+def _win_clipboard_api():
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    u32.OpenClipboard.argtypes = [wintypes.HWND]
+    u32.OpenClipboard.restype = wintypes.BOOL
+    u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    u32.SetClipboardData.restype = wintypes.HANDLE
+    u32.GetClipboardOwner.restype = wintypes.HWND
+    u32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    u32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k32.GlobalAlloc.restype = wintypes.HGLOBAL
+    k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    return ctypes, wintypes, u32, k32
+
+
+def win_set_clipboard(hwnd: int, text: str) -> bool:
+    """Put text on the Windows clipboard for real (not a promise). False if it couldn't be done."""
+    if sys.platform != "win32":
+        return False
+    try:
+        ctypes, _, u32, k32 = _win_clipboard_api()
+        data = text.replace("\r\n", "\n").replace("\n", "\r\n").encode("utf-16-le") + b"\0\0"
+        for _ in range(10):                          # another program may be holding the clipboard open
+            if u32.OpenClipboard(hwnd):
+                break
+            time.sleep(0.02)
+        else:
+            return False
+        try:
+            u32.EmptyClipboard()
+            handle = k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+            if not handle:
+                return False
+            ptr = k32.GlobalLock(handle)
+            if not ptr:
+                k32.GlobalFree(handle)
+                return False
+            ctypes.memmove(ptr, data, len(data))
+            k32.GlobalUnlock(handle)
+            if not u32.SetClipboardData(CF_UNICODETEXT, handle):
+                k32.GlobalFree(handle)
+                return False
+            return True
+        finally:
+            u32.CloseClipboard()
+    except Exception:
+        return False
+
+
+def win_owns_clipboard() -> bool:
+    """True when the clipboard's current contents were put there by this process."""
+    if sys.platform != "win32":
+        return False
+    try:
+        ctypes, wintypes, u32, _ = _win_clipboard_api()
+        owner = u32.GetClipboardOwner()
+        if not owner:
+            return False
+        pid = wintypes.DWORD()
+        u32.GetWindowThreadProcessId(owner, ctypes.byref(pid))
+        return pid.value == os.getpid()
+    except Exception:
+        return False
+
+
 # --------------------------------------------------------------------------- colors
 
 # Brand palettes (see the brand kit): navy #0F172A, cyan #22C3EE, slate #94A3B8 / #64748B, mist #F8FAFC.
@@ -7525,9 +7606,15 @@ class App:
         self.right_click = "<Button-2>" if self.is_mac and self.tk_version < (8, 7) else "<Button-3>"
 
         root.title(APP_NAME)
-        height = min(900, root.winfo_screenheight() - 120)
-        width = min(1040, root.winfo_screenwidth() - 80)
-        root.geometry(self.settings.get("geometry", f"{width}x{height}"))
+        # Only the window's size is remembered, never its position: a saved position can point at a
+        # monitor that is no longer connected, which opens the window where it can't be seen or reached.
+        # With no position given, the window manager places it on the primary screen.
+        max_w, max_h = root.winfo_screenwidth() - 80, root.winfo_screenheight() - 120
+        width, height = min(1040, max_w), min(900, max_h)
+        saved = re.match(r"(\d+)x(\d+)", str(self.settings.get("geometry", "")))
+        if saved:                                    # older settings files also carry "+x+y"; ignore it
+            width, height = min(int(saved.group(1)), max_w), min(int(saved.group(2)), max_h)
+        root.geometry(f"{width}x{height}")
         root.minsize(560, 360)
         self._set_icon()
         self._style(ws)
@@ -8095,10 +8182,10 @@ class App:
         """Widen the window (if the screen allows) so every tab label shows in full."""
         self.root.update_idletasks()
         need = self.notebook.winfo_reqwidth() + 16
-        m = re.match(r"(\d+)x(\d+)(.*)", self.root.geometry())
+        m = re.match(r"(\d+)x(\d+)", self.root.geometry())
         if m and int(m.group(1)) < need:
             width = min(need, self.root.winfo_screenwidth() - 40)
-            self.root.geometry(f"{width}x{m.group(2)}{m.group(3) if 'geometry' in self.settings else ''}")
+            self.root.geometry(f"{width}x{m.group(2)}")      # size only: leave the position alone
 
     def _bind_mousewheel(self):
         """Wheel / trackpad scrolls whatever is under the pointer: a text box or table that has its own
@@ -8633,6 +8720,82 @@ class App:
                 self.root.bind_class(cls, seq, self._text_menu, add="+")
         for seq in seqs:
             self.root.bind_class("Treeview", seq, self._plain_tree_menu, add="+")
+        self._install_clipboard_fixes()
+
+    def _install_clipboard_fixes(self):
+        """Make copy / paste behave the same in every box on every platform, where plain Tk doesn't:
+          * tables have no keyboard copy at all, so Ctrl/⌘+C copies the selected rows;
+          * Tk 8.6 on Linux and macOS never focuses a read-only text box on click, so Ctrl/⌘+C in an
+            output box did nothing (or copied from whichever box had the focus before);
+          * on Linux, pasting over a selection inserts beside it instead of replacing it, and Ctrl+A
+            jumps to the start of the line instead of selecting everything."""
+        root = self.root
+        root.bind_class("Treeview", "<<Copy>>", self._copy_tree_rows, add="+")
+        root.bind_class("Text", "<Button-1>", lambda e: e.widget.focus_set(), add="+")
+        if sys.platform == "win32":                  # Ctrl+C / Ctrl+X in any box: see win_set_clipboard
+            for cls in ("Text", "Entry", "TEntry", "TCombobox"):
+                for seq in ("<<Copy>>", "<<Cut>>"):
+                    root.bind_class(cls, seq, lambda e: root.after_idle(self._pin_clipboard), add="+")
+        if root.tk.call("tk", "windowingsystem") != "x11":
+            return
+        root.bind_class("Text", "<<Paste>>", self._paste_over_selection)
+        root.bind_class("Entry", "<<Paste>>", self._paste_over_selection)
+        for cls in ("Text", "Entry", "TEntry", "TCombobox"):
+            root.bind_class(cls, "<Control-a>", lambda e: (self._select_all(e.widget), "break")[1])
+
+    def _pin_clipboard(self):
+        """Windows: if the clipboard holds text this app copied, make sure it is really there (it
+        otherwise disappears when the app closes). Never touches what another program copied."""
+        if not win_owns_clipboard():
+            return
+        try:
+            text = self.root.clipboard_get()
+        except tk.TclError:
+            return
+        if text:
+            win_set_clipboard(self.root.winfo_id(), text)
+
+    def _copy_tree_rows(self, e):
+        tree = e.widget
+        try:
+            picked = set(tree.selection())
+            if not picked:
+                return None
+            top = [i for i in tree.get_children("") if i in picked]
+            rows = top if len(top) == len(picked) else tree.selection()    # nested rows: keep Tk's order
+            self.copy(texttable.tree_table(tree, rows))
+        except tk.TclError:
+            return None
+        return "break"
+
+    @staticmethod
+    def _paste_over_selection(e):
+        """<<Paste>> for Text and Entry on X11: replace the selection, as on Windows and macOS."""
+        w = e.widget
+        try:
+            clip = w.clipboard_get()
+        except tk.TclError:
+            return "break"
+        is_text = isinstance(w, tk.Text)
+        auto = is_text and bool(w.cget("autoseparators"))
+        try:
+            if auto:                                 # one undo step for the whole paste
+                w.configure(autoseparators=False)
+                w.edit_separator()
+            try:
+                w.delete("sel.first", "sel.last")
+            except tk.TclError:
+                pass                                 # nothing selected
+            w.insert("insert", clip)
+            if is_text:
+                w.see("insert")
+        except tk.TclError:
+            pass
+        finally:
+            if auto:
+                w.edit_separator()
+                w.configure(autoseparators=True)
+        return "break"
 
     def _plain_tree_menu(self, e):
         """Tables that don't have their own right-click menu get Copy + Send to."""
@@ -8976,6 +9139,7 @@ class App:
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.root.update_idletasks()
+        win_set_clipboard(self.root.winfo_id(), text)
         first = text.splitlines()[0] if text else ""
         more = f"  (+{text.count(chr(10))} more lines)" if "\n" in text else ""
         self.flash(f"Copied: {first}{more}")
@@ -9064,7 +9228,7 @@ class App:
             whois_asns=self.whois.do_asns_v.get(),
             whois_bare_asns=self.whois.bare_v.get(),
             whois_domains=self.whois.do_domains_v.get(),
-            geometry=self.root.geometry(),
+            geometry=self.root.geometry().split("+")[0],     # size only, see App.__init__
             favorites=self.favorites,
             known_tools=[t[0] for t in self.tools],
             last_tool=self.current,
@@ -9090,6 +9254,7 @@ class App:
         self.irr.stop()
 
     def on_close(self):
+        self._pin_clipboard()
         self.collect_settings()
         self._stop_everything()
         save_settings(self.settings)
